@@ -26,6 +26,9 @@ type ClusterConfig struct {
 type ServerConfig struct {
 	Port            string
 	MaxPayloadBytes uint32
+	// AuthToken is the pre-shared secret clients must present before any command.
+	// Empty string disables auth (useful for local dev / testing).
+	AuthToken string
 }
 
 type StoreConfig struct {
@@ -111,6 +114,9 @@ func Load() Config {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.WAL.MaxBatchSize = n
 		}
+	}
+	if v := os.Getenv("KV_AUTH_TOKEN"); v != "" {
+		cfg.Server.AuthToken = v
 	}
 	if v := os.Getenv("KV_NODE_ADDR"); v != "" {
 		cfg.Cluster.NodeAddr = v

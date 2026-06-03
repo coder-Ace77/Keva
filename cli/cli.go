@@ -30,10 +30,11 @@ type kvClient struct {
 	knownAddrs []string // seed + topology-discovered addresses
 	leaderAddr string
 	followers  []string
+	authToken  string
 }
 
-func newClient(seed string) *kvClient {
-	return &kvClient{knownAddrs: []string{seed}}
+func newClient(seed string, token string) *kvClient {
+	return &kvClient{knownAddrs: []string{seed}, authToken: token}
 }
 
 // connect fetches topology from any reachable known node and updates routing state.
@@ -124,6 +125,10 @@ func (c *kvClient) fetchTopology(addr string) (*protocol.TopologyResponse, error
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(2 * time.Second)) //nolint
 
+	if err := c.authConn(conn); err != nil {
+		return nil, err
+	}
+
 	if err := sendMessage(conn, &protocol.TopologyRequest{}); err != nil {
 		return nil, err
 	}
@@ -146,10 +151,46 @@ func (c *kvClient) sendToNode(addr string, msg protocol.Message) (protocol.Messa
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint
 
+	if err := c.authConn(conn); err != nil {
+		return nil, err
+	}
+
 	if err := sendMessage(conn, msg); err != nil {
 		return nil, err
 	}
 	return receiveMessage(conn)
+}
+
+// authConn sends OpAuth and verifies the response when a token is configured.
+// It is a no-op when no token is set.
+func (c *kvClient) authConn(conn net.Conn) error {
+	if c.authToken == "" {
+		return nil
+	}
+
+	if err := sendMessage(conn, &protocol.AuthMessage{Token: []byte(c.authToken)}); err != nil {
+		return fmt.Errorf("auth send: %w", err)
+	}
+
+	resp, err := receiveMessage(conn)
+	if err != nil {
+		return fmt.Errorf("auth recv: %w", err)
+	}
+
+	authResp, ok := resp.(*protocol.AuthResponse)
+	if !ok {
+		// Server sent an error instead of AuthResponse
+		if errMsg, ok := resp.(*protocol.ErrorMessage); ok {
+			return fmt.Errorf("auth rejected: %s", errMsg.Message)
+		}
+		return fmt.Errorf("unexpected auth response opcode 0x%02X", resp.OpCode())
+	}
+
+	if !authResp.Success {
+		return fmt.Errorf("authentication failed: invalid token")
+	}
+
+	return nil
 }
 
 // ── Wire helpers ──────────────────────────────────────────────────────────────
@@ -186,6 +227,8 @@ func receiveMessage(conn net.Conn) (protocol.Message, error) {
 func main() {
 	url := flag.String("url", "", "any cluster node to connect to (e.g. localhost:7001)")
 	flag.StringVar(url, "u", "", "any cluster node to connect to (shorthand)")
+	token := flag.String("token", "", "auth token (or set KV_AUTH_TOKEN env var)")
+	flag.StringVar(token, "t", "", "auth token (shorthand)")
 	flag.Parse()
 
 	seed := defaultAddr
@@ -195,9 +238,14 @@ func main() {
 		seed = v
 	}
 
+	authToken := *token
+	if authToken == "" {
+		authToken = os.Getenv("KV_AUTH_TOKEN")
+	}
+
 	fmt.Printf("%s%sConnecting to cluster via %s...%s\n", ColorCyan, ColorBold, seed, ColorReset)
 
-	client := newClient(seed)
+	client := newClient(seed, authToken)
 	if err := client.waitForLeader(); err != nil {
 		fmt.Printf("%sFailed to discover cluster: %v%s\n", ColorRed, err, ColorReset)
 		os.Exit(1)

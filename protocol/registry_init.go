@@ -37,6 +37,10 @@ func init() {
 	Register(OpForwardWrite, func() Message { return &ForwardWrite{} })
 	Register(OpForwardWriteResponse, func() Message { return &ForwardWriteResponse{} })
 
+	// Auth
+	Register(OpAuth, func() Message { return &AuthMessage{} })
+	Register(OpAuthResponse, func() Message { return &AuthResponse{} })
+
 	// Errors
 	Register(OpError, func() Message { return &ErrorMessage{} })
 }

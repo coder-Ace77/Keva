@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -14,10 +15,11 @@ type TCPServer struct {
 	node            *cluster.Node
 	listener        net.Listener
 	maxPayloadBytes uint32
+	authToken       string
 }
 
-func NewTCPServer(node *cluster.Node, maxPayloadBytes uint32) *TCPServer {
-	return &TCPServer{node: node, maxPayloadBytes: maxPayloadBytes}
+func NewTCPServer(node *cluster.Node, maxPayloadBytes uint32, authToken string) *TCPServer {
+	return &TCPServer{node: node, maxPayloadBytes: maxPayloadBytes, authToken: authToken}
 }
 
 func (s *TCPServer) Start(address string) error {
@@ -27,6 +29,9 @@ func (s *TCPServer) Start(address string) error {
 		return err
 	}
 	fmt.Printf("node listening on %s\n", address)
+	if s.authToken != "" {
+		fmt.Println("auth: token authentication enabled")
+	}
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -38,7 +43,8 @@ func (s *TCPServer) Start(address string) error {
 }
 
 // handleConnection reads the first frame and routes based on opcode.
-// Each branch owns the conn's lifetime independently.
+// Cluster-internal opcodes (heartbeat, vote, replication) bypass auth.
+// All client traffic must authenticate first when a token is configured.
 func (s *TCPServer) handleConnection(conn net.Conn) {
 	firstMsg, err := s.readMessage(conn)
 	if err != nil {
@@ -48,9 +54,8 @@ func (s *TCPServer) handleConnection(conn net.Conn) {
 
 	switch firstMsg.OpCode() {
 
-	// ── Cluster internal messages ─────────────────────────────────────────
+	// ── Cluster internal messages — bypass auth ───────────────────────────
 	case protocol.OpReplicationJoin:
-		// Conn ownership transferred to leader.AddFollower / drainAcks.
 		s.handleReplicationPeer(conn, firstMsg)
 
 	case protocol.OpHeartbeat:
@@ -65,22 +70,60 @@ func (s *TCPServer) handleConnection(conn net.Conn) {
 		granted, term := s.node.HandleVoteRequest(req)
 		_ = s.writeMessage(conn, &protocol.VoteResponse{Term: term, Granted: granted})
 
-	case protocol.OpTopologyRequest:
-		defer conn.Close()
-		_ = s.writeMessage(conn, s.node.GetTopology())
-
-	// ── Client CRUD — this goroutine owns the conn ────────────────────────
+	// ── All client traffic — auth gate applies ────────────────────────────
 	default:
 		defer conn.Close()
-		s.dispatchToEngine(conn, firstMsg)
+
+		if s.authToken != "" {
+			firstMsg, err = s.authenticate(conn, firstMsg)
+			if err != nil {
+				return
+			}
+		}
+
+		s.dispatchClient(conn, firstMsg)
 		for {
 			msg, err := s.readMessage(conn)
 			if err != nil {
 				return
 			}
-			s.dispatchToEngine(conn, msg)
+			s.dispatchClient(conn, msg)
 		}
 	}
+}
+
+// authenticate validates the OpAuth handshake. Returns the first real command
+// message to process, or an error if auth fails.
+func (s *TCPServer) authenticate(conn net.Conn, firstMsg protocol.Message) (protocol.Message, error) {
+	if firstMsg.OpCode() != protocol.OpAuth {
+		s.writeError(conn, protocol.ErrCodeUnauthorized, "authentication required")
+		return nil, fmt.Errorf("auth required")
+	}
+
+	auth := firstMsg.(*protocol.AuthMessage)
+	tokenMatch := subtle.ConstantTimeCompare(auth.Token, []byte(s.authToken)) == 1
+	if !tokenMatch {
+		_ = s.writeMessage(conn, &protocol.AuthResponse{Success: false})
+		return nil, fmt.Errorf("invalid token")
+	}
+
+	_ = s.writeMessage(conn, &protocol.AuthResponse{Success: true})
+
+	msg, err := s.readMessage(conn)
+	if err != nil {
+		return nil, err
+	}
+	return msg, nil
+}
+
+// dispatchClient routes client messages: topology requests are handled directly,
+// everything else goes through the engine.
+func (s *TCPServer) dispatchClient(conn net.Conn, msg protocol.Message) {
+	if msg.OpCode() == protocol.OpTopologyRequest {
+		_ = s.writeMessage(conn, s.node.GetTopology())
+		return
+	}
+	s.dispatchToEngine(conn, msg)
 }
 
 func (s *TCPServer) handleReplicationPeer(conn net.Conn, firstMsg protocol.Message) {

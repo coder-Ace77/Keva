@@ -1,14 +1,32 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"flag"
+	"fmt"
 	"key_value_store/cluster"
 	"key_value_store/config"
 	"key_value_store/server"
 	"key_value_store/store"
 	"log"
+	"os"
 )
 
 func main() {
+	genToken := flag.Bool("gen-token", false, "generate a random auth token, print it, and exit")
+	flag.Parse()
+
+	if *genToken {
+		token, err := generateToken()
+		if err != nil {
+			log.Fatalf("failed to generate token: %v", err)
+		}
+		fmt.Println(token)
+		fmt.Fprintf(os.Stderr, "Set KV_AUTH_TOKEN=%s on both server and client.\n", token)
+		os.Exit(0)
+	}
+
 	cfg := config.Load()
 
 	walOpts := store.WALOptions{
@@ -31,26 +49,33 @@ func main() {
 	nodeAddr := cfg.Cluster.NodeAddr
 
 	if nodeAddr == "" || len(peers) == 0 {
-		// Standalone mode — single node, no Raft.
-		log.Printf("mode=standalone  port=%s  wal=%s", cfg.Server.Port, cfg.Store.WALPath)
+		log.Printf("mode=standalone  port=%s  wal=%s  auth=%v",
+			cfg.Server.Port, cfg.Store.WALPath, cfg.Server.AuthToken != "")
 		node := cluster.NewNode(db, cfg.Store.DefaultTTL, "", nil)
-		// Immediately promote to leader so writes are accepted.
 		node.ForceLeader()
-		tcpServer := server.NewTCPServer(node, cfg.Server.MaxPayloadBytes)
+		tcpServer := server.NewTCPServer(node, cfg.Server.MaxPayloadBytes, cfg.Server.AuthToken)
 		if err := tcpServer.Start(cfg.Server.Port); err != nil {
 			log.Fatalf("network error: %v", err)
 		}
 		return
 	}
 
-	log.Printf("mode=cluster  node=%s  peers=%v  port=%s  wal=%s",
-		nodeAddr, peers, cfg.Server.Port, cfg.Store.WALPath)
+	log.Printf("mode=cluster  node=%s  peers=%v  port=%s  wal=%s  auth=%v",
+		nodeAddr, peers, cfg.Server.Port, cfg.Store.WALPath, cfg.Server.AuthToken != "")
 
 	node := cluster.NewNode(db, cfg.Store.DefaultTTL, nodeAddr, peers)
 	node.Start()
 
-	tcpServer := server.NewTCPServer(node, cfg.Server.MaxPayloadBytes)
+	tcpServer := server.NewTCPServer(node, cfg.Server.MaxPayloadBytes, cfg.Server.AuthToken)
 	if err := tcpServer.Start(cfg.Server.Port); err != nil {
 		log.Fatalf("network error: %v", err)
 	}
+}
+
+func generateToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }

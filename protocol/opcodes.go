@@ -46,6 +46,12 @@ const (
 	OpForwardWriteResponse byte = 0x51 // Leader → Follower   : Result of forwarded write
 )
 
+// Auth: Client → Node handshake before any command
+const (
+	OpAuth         byte = 0x60 // Client → Node       : Present secret token
+	OpAuthResponse byte = 0x61 // Node → Client        : Auth result
+)
+
 // Errors
 const (
 	OpError byte = 0xFE // Any → Any : Structured error
@@ -55,9 +61,10 @@ const (
 // Well-known error codes used in ErrorMessage
 // ─────────────────────────────────────────────────────────────────────────────
 const (
-	ErrCodeNotLeader   uint16 = 1 // Write was sent to a follower
-	ErrCodeKeyNotFound uint16 = 2 // Key does not exist
-	ErrCodeInternal    uint16 = 3 // Unexpected server error
-	ErrCodeBadRequest  uint16 = 4 // Malformed message
-	ErrCodeTimeout     uint16 = 5 // Operation timed out
+	ErrCodeNotLeader     uint16 = 1 // Write was sent to a follower
+	ErrCodeKeyNotFound   uint16 = 2 // Key does not exist
+	ErrCodeInternal      uint16 = 3 // Unexpected server error
+	ErrCodeBadRequest    uint16 = 4 // Malformed message
+	ErrCodeTimeout       uint16 = 5 // Operation timed out
+	ErrCodeUnauthorized  uint16 = 6 // Missing or invalid auth token
 )
