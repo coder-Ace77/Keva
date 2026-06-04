@@ -1,6 +1,7 @@
 package store
 
 import (
+	"container/list"
 	"encoding/binary"
 	"errors"
 	"hash/fnv"
@@ -17,18 +18,27 @@ type Record struct {
 	expiredAt time.Time // ttl support
 }
 
-// errors
-var ErrKeyNotFound = errors.New("key not found")
+var (
+	ErrKeyNotFound = errors.New("key not found")
+	ErrMemoryFull  = errors.New("memory limit reached: write rejected (noevict policy)")
+)
 
 // StoreOptions controls the in-memory storage behaviour.
 type StoreOptions struct {
-	ShardCount int           // Number of hash shards (must be > 0)
-	DefaultTTL time.Duration // TTL applied when the client sends TTL == 0
+	ShardCount     int           // number of hash shards (must be > 0)
+	DefaultTTL     time.Duration // TTL when the client sends TTL == 0
+	MaxMemoryBytes int64         // total byte cap across all shards; 0 = unlimited
+	Eviction       Eviction      // nil → NoEvict
 }
 
 type Shard struct {
-	mu   sync.RWMutex
-	data map[string]Record
+	mu     sync.RWMutex
+	data   map[string]Record
+	bytes  int64                    // current memory: sum of len(key)+len(value)
+	budget int64                    // per-shard byte cap (MaxMemoryBytes/ShardCount); 0 = unlimited
+	// populated only in strict LRU mode
+	lru     *list.List
+	lruKeys map[string]*list.Element
 }
 
 type KVStore struct {
@@ -36,13 +46,23 @@ type KVStore struct {
 	wal        *WAL
 	shardCount uint32
 	defaultTTL time.Duration
+	eviction   Eviction
 }
 
 func NewKVStore(filePath string, walOpts WALOptions, storeOpts StoreOptions) (*KVStore, error) {
 	wal, err := NewWal(filePath, walOpts)
-
 	if err != nil {
 		return nil, err
+	}
+
+	ev := storeOpts.Eviction
+	if ev == nil {
+		ev = NoEvict{}
+	}
+
+	budget := int64(0)
+	if storeOpts.MaxMemoryBytes > 0 {
+		budget = storeOpts.MaxMemoryBytes / int64(storeOpts.ShardCount)
 	}
 
 	store := &KVStore{
@@ -50,17 +70,23 @@ func NewKVStore(filePath string, walOpts WALOptions, storeOpts StoreOptions) (*K
 		wal:        wal,
 		shardCount: uint32(storeOpts.ShardCount),
 		defaultTTL: storeOpts.DefaultTTL,
+		eviction:   ev,
 	}
 
 	for i := 0; i < storeOpts.ShardCount; i++ {
-		store.shards[i] = &Shard{
-			data: make(map[string]Record),
+		s := &Shard{
+			data:   make(map[string]Record),
+			budget: budget,
 		}
+		ev.InitShard(s)
+		store.shards[i] = s
 	}
 
 	if err := store.Replay(filePath); err != nil {
 		return nil, err
 	}
+	// Sync byte counters and eviction bookkeeping with replayed data.
+	store.rebuildEviction()
 
 	wal, err = NewWal(filePath, walOpts)
 	if err != nil {
@@ -68,8 +94,7 @@ func NewKVStore(filePath string, walOpts WALOptions, storeOpts StoreOptions) (*K
 	}
 	store.wal = wal
 
-	// start the gc
-
+	store.startGC()
 	return store, nil
 }
 
@@ -81,26 +106,7 @@ func (kv *KVStore) getShard(key string) *Shard {
 }
 
 func (kv *KVStore) Set(key string, value []byte) error {
-	expiredAt := time.Now().Add(kv.defaultTTL)
-
-	if err := kv.wal.AppendSet(key, value, expiredAt); err != nil {
-		return err // If disk fails, we abort. Data integrity is preserved.
-	}
-
-	valCopy := make([]byte, len(value))
-	copy(valCopy, value)
-
-	shard := kv.getShard(key)
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	shard.data[key] = Record{
-		value:     valCopy,
-		createdAt: time.Now(),
-		expiredAt: expiredAt,
-	}
-
-	return nil
+	return kv.SetWithExpiry(key, value, time.Now().Add(kv.defaultTTL))
 }
 
 // SetWithExpiry applies a write with a caller-supplied expiry time.
@@ -109,16 +115,35 @@ func (kv *KVStore) SetWithExpiry(key string, value []byte, expiredAt time.Time) 
 	if err := kv.wal.AppendSet(key, value, expiredAt); err != nil {
 		return err
 	}
+
 	valCopy := make([]byte, len(value))
 	copy(valCopy, value)
+
+	newSize := int64(len(key) + len(value))
 	shard := kv.getShard(key)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
+
+	// If the key already exists, subtract the old footprint and remove it
+	// from eviction bookkeeping before we overwrite.
+	if old, exists := shard.data[key]; exists {
+		shard.bytes -= int64(len(key) + len(old.value))
+		kv.eviction.OnRemove(shard, key)
+	}
+
+	// Let the eviction policy make room (or reject the write).
+	if !kv.eviction.OnWrite(shard, newSize) {
+		return ErrMemoryFull
+	}
+
 	shard.data[key] = Record{
 		value:     valCopy,
 		createdAt: time.Now(),
 		expiredAt: expiredAt,
 	}
+	shard.bytes += newSize
+	kv.eviction.AfterWrite(shard, key)
+
 	return nil
 }
 
@@ -126,25 +151,25 @@ func (kv *KVStore) Get(key string) ([]byte, error) {
 	shard := kv.getShard(key)
 
 	shard.mu.RLock()
-	defer shard.mu.RUnlock()
-
 	record, ok := shard.data[key]
-	if !ok {
-		return nil, ErrKeyNotFound
-	}
+	shard.mu.RUnlock()
 
-	if time.Now().After(record.expiredAt) {
+	if !ok || time.Now().After(record.expiredAt) {
 		return nil, ErrKeyNotFound
 	}
 
 	valCopy := make([]byte, len(record.value))
 	copy(valCopy, record.value)
 
+	// OnRead is called after releasing the read lock.
+	// LRUEvict will re-acquire the write lock internally to move the key
+	// to the front of the list. NoEvict and SamplingEvict are no-ops.
+	kv.eviction.OnRead(shard, key)
+
 	return valCopy, nil
 }
 
 func (kv *KVStore) Delete(key string) error {
-
 	if err := kv.wal.AppendDelete(key); err != nil {
 		return err
 	}
@@ -153,33 +178,49 @@ func (kv *KVStore) Delete(key string) error {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	if _, ok := shard.data[key]; !ok {
+	rec, ok := shard.data[key]
+	if !ok {
 		return ErrKeyNotFound
 	}
+	shard.bytes -= int64(len(key) + len(rec.value))
+	kv.eviction.OnRemove(shard, key)
 	delete(shard.data, key)
 	return nil
 }
 
 func (kv *KVStore) startGC() {
 	go func() {
-		// Sweep every 1 minute
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
-
 		for range ticker.C {
-			// Iterate over each shard independently
+			now := time.Now()
 			for _, shard := range kv.shards {
-				// We lock the shard briefly to clean it
 				shard.mu.Lock()
-				for key, record := range shard.data {
-					if time.Now().After(record.expiredAt) {
-						delete(shard.data, key) // Active TTL Deletion
+				for key, rec := range shard.data {
+					if now.After(rec.expiredAt) {
+						shard.bytes -= int64(len(key) + len(rec.value))
+						kv.eviction.OnRemove(shard, key)
+						delete(shard.data, key)
 					}
 				}
 				shard.mu.Unlock()
 			}
 		}
 	}()
+}
+
+// rebuildEviction recomputes byte counters and repopulates eviction
+// bookkeeping (e.g. the LRU list) from the data that was just replayed
+// from the WAL. Must be called before the store is opened for writes.
+func (kv *KVStore) rebuildEviction() {
+	for _, shard := range kv.shards {
+		shard.mu.Lock()
+		for key, rec := range shard.data {
+			shard.bytes += int64(len(key) + len(rec.value))
+			kv.eviction.AfterWrite(shard, key)
+		}
+		shard.mu.Unlock()
+	}
 }
 
 func (kv *KVStore) Replay(filepath string) error {
