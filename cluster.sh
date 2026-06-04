@@ -180,9 +180,6 @@ cmd_status() {
 
     read -r P0 P1 P2 < "$PID_FILE"
     echo "PID file: $PID_FILE"
-    for port pid in "${NODE0_PORT}" "${P0}" "${NODE1_PORT}" "${P1}" "${NODE2_PORT}" "${P2}"; do
-        :
-    done
 
     local pairs=("${NODE0_PORT}:${P0}" "${NODE1_PORT}:${P1}" "${NODE2_PORT}:${P2}")
     for pair in "${pairs[@]}"; do
