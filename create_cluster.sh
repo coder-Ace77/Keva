@@ -7,9 +7,14 @@ go build -o ./kvstore .
 echo "Build OK"
 
 # ─── Random ports (non-overlapping ranges) ────────────────────────────────────
-NODE0_PORT=$(( (RANDOM % 5000) + 20000 ))
-NODE1_PORT=$(( (RANDOM % 5000) + 25000 ))
-NODE2_PORT=$(( (RANDOM % 5000) + 30000 ))
+# NODE0_PORT=$(( (RANDOM % 5000) + 20000 ))
+# NODE1_PORT=$(( (RANDOM % 5000) + 25000 ))
+# NODE2_PORT=$(( (RANDOM % 5000) + 30000 ))
+
+NODE0_PORT=7001
+NODE1_PORT=7002
+NODE2_PORT=7003
+
 
 PEERS="localhost:${NODE0_PORT},localhost:${NODE1_PORT},localhost:${NODE2_PORT}"
 

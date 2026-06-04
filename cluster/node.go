@@ -41,8 +41,11 @@ func (n *Node) ForceLeader() {
 
 // ── engine.Store interface ────────────────────────────────────────────────────
 
-func (n *Node) Set(key string, value []byte) error {
-	expiredAt := time.Now().Add(n.defaultTTL)
+func (n *Node) Set(key string, value []byte, ttl time.Duration) error {
+	if ttl <= 0 {
+		ttl = n.defaultTTL
+	}
+	expiredAt := time.Now().Add(ttl)
 	if err := n.db.SetWithExpiry(key, value, expiredAt); err != nil {
 		return err
 	}

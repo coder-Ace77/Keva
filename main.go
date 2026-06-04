@@ -34,9 +34,14 @@ func main() {
 		FlushInterval: cfg.WAL.FlushInterval,
 		MaxBatchSize:  cfg.WAL.MaxBatchSize,
 	}
+
+	eviction := evictionPolicy(cfg.Store.EvictionPolicy)
+
 	storeOpts := store.StoreOptions{
-		ShardCount: cfg.Store.ShardCount,
-		DefaultTTL: cfg.Store.DefaultTTL,
+		ShardCount:     cfg.Store.ShardCount,
+		DefaultTTL:     cfg.Store.DefaultTTL,
+		MaxMemoryBytes: cfg.Store.MaxMemoryBytes,
+		Eviction:       eviction,
 	}
 
 	db, err := store.NewKVStore(cfg.Store.WALPath, walOpts, storeOpts)
@@ -49,8 +54,9 @@ func main() {
 	nodeAddr := cfg.Cluster.NodeAddr
 
 	if nodeAddr == "" || len(peers) == 0 {
-		log.Printf("mode=standalone  port=%s  wal=%s  auth=%v",
-			cfg.Server.Port, cfg.Store.WALPath, cfg.Server.AuthToken != "")
+		log.Printf("mode=standalone  port=%s  wal=%s  auth=%v  eviction=%s  max_memory=%s",
+			cfg.Server.Port, cfg.Store.WALPath, cfg.Server.AuthToken != "",
+			cfg.Store.EvictionPolicy, config.FormatMemoryBytes(cfg.Store.MaxMemoryBytes))
 		node := cluster.NewNode(db, cfg.Store.DefaultTTL, "", nil)
 		node.ForceLeader()
 		tcpServer := server.NewTCPServer(node, cfg.Server.MaxPayloadBytes, cfg.Server.AuthToken)
@@ -60,8 +66,9 @@ func main() {
 		return
 	}
 
-	log.Printf("mode=cluster  node=%s  peers=%v  port=%s  wal=%s  auth=%v",
-		nodeAddr, peers, cfg.Server.Port, cfg.Store.WALPath, cfg.Server.AuthToken != "")
+	log.Printf("mode=cluster  node=%s  peers=%v  port=%s  wal=%s  auth=%v  eviction=%s  max_memory=%s",
+		nodeAddr, peers, cfg.Server.Port, cfg.Store.WALPath, cfg.Server.AuthToken != "",
+		cfg.Store.EvictionPolicy, config.FormatMemoryBytes(cfg.Store.MaxMemoryBytes))
 
 	node := cluster.NewNode(db, cfg.Store.DefaultTTL, nodeAddr, peers)
 	node.Start()
@@ -78,4 +85,15 @@ func generateToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+func evictionPolicy(name string) store.Eviction {
+	switch name {
+	case "relaxed":
+		return store.SamplingEvict{}
+	case "strict":
+		return store.LRUEvict{}
+	default: // "noevict" or empty
+		return store.NoEvict{}
+	}
 }

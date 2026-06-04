@@ -4,12 +4,13 @@ import (
 	"fmt"
 	"key_value_store/protocol"
 	"sync"
+	"time"
 )
 
 // Store is the interface the engine dispatches against.
-// Both *store.KVStore and *cluster.Node satisfy it structurally.
+// ttl == 0 in Set means "use the server default".
 type Store interface {
-	Set(key string, value []byte) error
+	Set(key string, value []byte, ttl time.Duration) error
 	Get(key string) ([]byte, error)
 	Delete(key string) error
 }
