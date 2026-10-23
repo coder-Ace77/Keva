@@ -8,7 +8,7 @@
 #   status show which nodes are alive
 #
 # USAGE
-#   ./cluster.sh up [--max-memory SIZE] [--eviction POLICY] [--token TOKEN]
+#   ./cluster.sh up [--max-memory SIZE] [--eviction POLICY]
 #   ./cluster.sh bench [output.csv]
 #   ./cluster.sh down
 #   ./cluster.sh status
@@ -16,7 +16,6 @@
 # OPTIONS (for 'up')
 #   --max-memory SIZE    e.g. 256MB, 1GB, 512KB  (default: unlimited)
 #   --eviction POLICY    noevict | relaxed | strict  (default: noevict)
-#   --token TOKEN        shared auth token (default: none)
 #
 # EXAMPLES
 #   ./cluster.sh up
@@ -49,13 +48,11 @@ LOG2="${STATE_DIR}/node2.log"
 cmd_up() {
     local MAX_MEMORY=""
     local EVICTION="noevict"
-    local TOKEN=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --max-memory) MAX_MEMORY="$2"; shift 2 ;;
             --eviction)   EVICTION="$2";   shift 2 ;;
-            --token)      TOKEN="$2";      shift 2 ;;
             *) echo "Unknown option: $1"; exit 1 ;;
         esac
     done
@@ -78,7 +75,6 @@ cmd_up() {
         KV_EVICTION_POLICY="${EVICTION}"
     )
     [[ -n "$MAX_MEMORY" ]] && COMMON_ENV+=(KV_MAX_MEMORY="${MAX_MEMORY}")
-    [[ -n "$TOKEN" ]]      && COMMON_ENV+=(KV_AUTH_TOKEN="${TOKEN}")
 
     env "${COMMON_ENV[@]}" \
         KV_PORT=":${NODE0_PORT}" \
@@ -213,7 +209,7 @@ case "$COMMAND" in
     *)
         echo "Usage: $0 {up|down|bench|status}"
         echo ""
-        echo "  up [--max-memory SIZE] [--eviction noevict|relaxed|strict] [--token TOKEN]"
+        echo "  up [--max-memory SIZE] [--eviction noevict|relaxed|strict]"
         echo "  bench [output.csv]"
         echo "  down"
         echo "  status"

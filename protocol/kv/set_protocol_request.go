@@ -1,11 +1,12 @@
-package protocol
+package kv
 
 import (
 	"encoding/binary"
+	"key_value_store/protocol"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SetPayload — Client sends this to the leader to write a key-value pair.
+// SetRequest — Client sends this to the leader to write a key-value pair.
 //
 // Wire format:
 //   [KeyLen 2B] [ValueLen 4B] [TTL 8B] [Key ...] [Value ...]
@@ -14,17 +15,21 @@ import (
 // "use the server default".
 // ─────────────────────────────────────────────────────────────────────────────
 
+func init() {
+	protocol.Register(protocol.OpSet, func() protocol.Message { return &SetRequest{} })
+}
+
 const setHeaderSize = 2 + 4 + 8 // keyLen + valLen + TTL = 14 bytes
 
-type SetPayload struct {
+type SetRequest struct {
 	Key   []byte
 	Value []byte
 	TTL   uint64 // Nanoseconds. 0 = server default.
 }
 
-func (s *SetPayload) OpCode() byte { return OpSet }
+func (s *SetRequest) OpCode() byte { return protocol.OpSet }
 
-func (s *SetPayload) Encode() ([]byte, error) {
+func (s *SetRequest) Encode() ([]byte, error) {
 	keyLen := len(s.Key)
 	valLen := len(s.Value)
 
@@ -40,18 +45,17 @@ func (s *SetPayload) Encode() ([]byte, error) {
 	return buf, nil
 }
 
-func (s *SetPayload) Decode(data []byte) error {
+func (s *SetRequest) Decode(data []byte) error {
 	if len(data) < setHeaderSize {
-		return ErrPayloadTooShort
+		return protocol.ErrPayloadTooShort
 	}
 
 	keyLen := binary.BigEndian.Uint16(data[0:2])
 	valLen := binary.BigEndian.Uint32(data[2:6])
 	s.TTL = binary.BigEndian.Uint64(data[6:14])
 
-	expectedLen := setHeaderSize + int(keyLen) + int(valLen)
-	if len(data) < expectedLen {
-		return ErrPayloadTooShort
+	if len(data) < setHeaderSize+int(keyLen)+int(valLen) {
+		return protocol.ErrPayloadTooShort
 	}
 
 	s.Key = make([]byte, keyLen)

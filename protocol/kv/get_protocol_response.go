@@ -1,7 +1,8 @@
-package protocol
+package kv
 
 import (
 	"encoding/binary"
+	"key_value_store/protocol"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -14,12 +15,16 @@ import (
 // When Found == 0x00, ValueLen is 0 and Value is empty.
 // ─────────────────────────────────────────────────────────────────────────────
 
+func init() {
+	protocol.Register(protocol.OpGetResponse, func() protocol.Message { return &GetResponse{} })
+}
+
 type GetResponse struct {
 	Found bool
 	Value []byte
 }
 
-func (g *GetResponse) OpCode() byte { return OpGetResponse }
+func (g *GetResponse) OpCode() byte { return protocol.OpGetResponse }
 
 func (g *GetResponse) Encode() ([]byte, error) {
 	valLen := len(g.Value)
@@ -27,10 +32,7 @@ func (g *GetResponse) Encode() ([]byte, error) {
 
 	if g.Found {
 		buf[0] = 0x01
-	} else {
-		buf[0] = 0x00
 	}
-
 	binary.BigEndian.PutUint32(buf[1:5], uint32(valLen))
 	copy(buf[5:], g.Value)
 
@@ -39,14 +41,14 @@ func (g *GetResponse) Encode() ([]byte, error) {
 
 func (g *GetResponse) Decode(data []byte) error {
 	if len(data) < 5 {
-		return ErrPayloadTooShort
+		return protocol.ErrPayloadTooShort
 	}
 
 	g.Found = data[0] == 0x01
 	valLen := binary.BigEndian.Uint32(data[1:5])
 
 	if len(data) < 5+int(valLen) {
-		return ErrPayloadTooShort
+		return protocol.ErrPayloadTooShort
 	}
 
 	g.Value = make([]byte, valLen)

@@ -315,6 +315,5 @@ A 3-node cluster is the standard recommendation. Adding more nodes improves read
 - **No log ordering guarantees on replication** — under heavy concurrent writes to the leader, followers may briefly diverge before catching up. Strong consistency is not guaranteed.
 - **In-memory only** — all data must fit in RAM. There is no disk-based storage tier.
 - **TTL is server-default only** — clients cannot specify per-key TTL at the protocol level (the field exists in the protocol but the server applies the default).
-- **No authentication or TLS** — the server trusts all incoming connections. Do not expose the port to untrusted networks without a firewall or proxy.
 - **No WAL compaction trigger** — compaction must be called programmatically; there is no automatic background compaction.
 - **Write forwarding not implemented** — if a client accidentally sends a write to a follower, the follower writes it locally without replication. The topology-aware CLI prevents this under normal operation.

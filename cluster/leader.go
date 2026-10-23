@@ -1,10 +1,9 @@
 package cluster
 
 import (
-	"encoding/binary"
 	"fmt"
-	"io"
 	"key_value_store/protocol"
+	clusterproto "key_value_store/protocol/cluster"
 	"key_value_store/store"
 	"net"
 	"sync"
@@ -35,18 +34,18 @@ func (l *Leader) AddFollower(nodeAddr string, conn net.Conn) {
 
 // BroadcastSet replicates a SET to all followers.
 func (l *Leader) BroadcastSet(key string, value []byte, expiredAt int64) {
-	l.broadcast(&protocol.ReplicationSync{
-		LogIndex: l.logIndex.Add(1),
-		Op:       store.OpSet,
-		Key:      []byte(key),
-		Value:    value,
-		TTL:      uint64(expiredAt), // absolute Unix nanoseconds
+	l.broadcast(&clusterproto.ReplicationSync{
+		LogIndex:  l.logIndex.Add(1),
+		Op:        store.OpSet,
+		Key:       []byte(key),
+		Value:     value,
+		ExpiresAt: uint64(expiredAt),
 	})
 }
 
 // BroadcastDelete replicates a DELETE to all followers.
 func (l *Leader) BroadcastDelete(key string) {
-	l.broadcast(&protocol.ReplicationSync{
+	l.broadcast(&clusterproto.ReplicationSync{
 		LogIndex: l.logIndex.Add(1),
 		Op:       store.OpDelete,
 		Key:      []byte(key),
@@ -54,13 +53,10 @@ func (l *Leader) BroadcastDelete(key string) {
 }
 
 func (l *Leader) broadcast(msg protocol.Message) {
-	wire, err := protocol.EncodeMessage(msg)
+	frame, err := protocol.EncodeFrame(msg)
 	if err != nil {
 		return
 	}
-	header := make([]byte, 4)
-	binary.BigEndian.PutUint32(header, uint32(len(wire)))
-	frame := append(header, wire...)
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -82,14 +78,8 @@ func (l *Leader) broadcast(msg protocol.Message) {
 // When the connection drops, it removes the follower from the map.
 func (l *Leader) drainAcks(nodeAddr string, conn net.Conn) {
 	defer l.removeFollower(nodeAddr)
-	header := make([]byte, 4)
 	for {
-		if _, err := io.ReadFull(conn, header); err != nil {
-			return
-		}
-		msgLen := binary.BigEndian.Uint32(header)
-		frame := make([]byte, msgLen)
-		if _, err := io.ReadFull(conn, frame); err != nil {
+		if _, err := protocol.ReadFrame(conn, 0); err != nil {
 			return
 		}
 		// Acks are consumed but not acted on yet — future: track replication lag.

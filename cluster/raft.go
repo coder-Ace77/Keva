@@ -3,6 +3,7 @@ package cluster
 import (
 	"fmt"
 	"key_value_store/protocol"
+	clusterproto "key_value_store/protocol/cluster"
 	"math/rand"
 	"net"
 	"sync"
@@ -81,7 +82,7 @@ func (r *RaftState) HandleHeartbeat(term uint64, leaderID string) {
 }
 
 // HandleVoteRequest decides whether to grant a vote and returns (granted, currentTerm).
-func (r *RaftState) HandleVoteRequest(req *protocol.VoteRequest) (bool, uint64) {
+func (r *RaftState) HandleVoteRequest(req *clusterproto.VoteRequest) (bool, uint64) {
 	r.mu.Lock()
 
 	if req.Term < r.currentTerm {
@@ -282,18 +283,18 @@ func (r *RaftState) requestVoteRPC(peer string, term uint64) bool {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(200 * time.Millisecond)) //nolint
 
-	if err := sendFrame(conn, &protocol.VoteRequest{
+	if err := protocol.WriteFrame(conn, &clusterproto.VoteRequest{
 		Term:        term,
 		CandidateID: r.nodeAddr,
 	}); err != nil {
 		return false
 	}
 
-	msg, err := readFrame(conn)
+	msg, err := protocol.ReadFrame(conn, 0)
 	if err != nil {
 		return false
 	}
-	resp, ok := msg.(*protocol.VoteResponse)
+	resp, ok := msg.(*clusterproto.VoteResponse)
 	if !ok {
 		return false
 	}
@@ -318,11 +319,11 @@ func (r *RaftState) sendHeartbeatRPC(peer string, term uint64) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(heartbeatInterval)) //nolint
 
-	_ = sendFrame(conn, &protocol.Heartbeat{
+	_ = protocol.WriteFrame(conn, &clusterproto.Heartbeat{
 		Term:     term,
 		LeaderID: r.nodeAddr,
 	})
-	_, _ = readFrame(conn) // drain ack so the peer can close cleanly
+	_, _ = protocol.ReadFrame(conn, 0) // drain ack so the peer can close cleanly
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

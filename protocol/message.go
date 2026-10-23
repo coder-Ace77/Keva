@@ -1,7 +1,6 @@
 package protocol
 
 import (
-	"errors"
 	"fmt"
 	"sync"
 )
@@ -12,6 +11,9 @@ import (
 // Every protocol message (GET, SET, Heartbeat, ReplicationSync, etc.)
 // implements this interface. The OpCode identifies the type on the wire,
 // Encode serializes the payload, and Decode deserializes it.
+//
+// Message types live in the sub-packages (kv, cluster, client). Each message
+// file registers its own type in an init(), so this package never imports them.
 // ─────────────────────────────────────────────────────────────────────────────
 
 type Message interface {
@@ -21,23 +23,14 @@ type Message interface {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Registry — The core of the pattern.
+// Registry — opcode → factory for an empty Message of that type.
 //
-// Instead of a giant switch statement, we register each message type once.
 // Decoding becomes: read the opcode → look up the factory → construct → decode.
-// Adding a new message type = one Register() call + a struct. Zero changes to
-// the decode path.
 // ─────────────────────────────────────────────────────────────────────────────
 
 var (
 	registryMu sync.RWMutex
 	registry   = make(map[byte]func() Message)
-)
-
-var (
-	ErrUnknownOpCode  = errors.New("protocol: unknown opcode")
-	ErrPayloadTooShort = errors.New("protocol: payload too short")
-	ErrInvalidPayload  = errors.New("protocol: invalid payload")
 )
 
 // Register maps an opcode to a factory function that creates an empty Message
@@ -65,13 +58,9 @@ func Lookup(opcode byte) (Message, bool) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Wire helpers
+// Message codec — [OpCode 1B] [Payload ...]
 //
-// EncodeMessage: [OpCode 1B] [Payload ...]
-// DecodeMessage: reads opcode, looks up factory, decodes payload.
-//
-// The caller is responsible for wrapping this in the TCP length-prefix frame:
-//   [TotalLength 4B] [OpCode 1B] [Payload ...]
+// The TCP length prefix is added by frame.go.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // EncodeMessage serializes a Message to wire format: [OpCode 1B][Payload...].
@@ -81,7 +70,6 @@ func EncodeMessage(msg Message) ([]byte, error) {
 		return nil, fmt.Errorf("protocol: encode error for opcode 0x%02X: %w", msg.OpCode(), err)
 	}
 
-	// 1 byte for opcode + payload
 	wire := make([]byte, 1+len(payload))
 	wire[0] = msg.OpCode()
 	copy(wire[1:], payload)

@@ -1,10 +1,10 @@
 package cluster
 
 import (
-	"encoding/binary"
+	"errors"
 	"fmt"
-	"io"
 	"key_value_store/protocol"
+	clusterproto "key_value_store/protocol/cluster"
 	"key_value_store/store"
 	"net"
 	"time"
@@ -44,44 +44,37 @@ func syncWithLeader(leaderAddr string, db *store.KVStore, nodeAddr string) error
 	}
 	defer conn.Close()
 
-	if err := sendFrame(conn, &protocol.ReplicationJoin{NodeAddr: nodeAddr}); err != nil {
+	if err := protocol.WriteFrame(conn, &clusterproto.ReplicationJoin{NodeAddr: nodeAddr}); err != nil {
 		return err
 	}
 	fmt.Printf("follower: registered with leader at %s\n", leaderAddr)
 
-	header := make([]byte, 4)
 	for {
-		if _, err := io.ReadFull(conn, header); err != nil {
-			return err
-		}
-		msgLen := binary.BigEndian.Uint32(header)
-		frame := make([]byte, msgLen)
-		if _, err := io.ReadFull(conn, frame); err != nil {
-			return err
-		}
-
-		msg, err := protocol.DecodeMessage(frame)
-		if err != nil {
+		msg, err := protocol.ReadFrame(conn, 0)
+		if errors.Is(err, protocol.ErrMalformedMessage) {
 			fmt.Printf("follower: decode error: %v\n", err)
 			continue
 		}
+		if err != nil {
+			return err
+		}
 
-		sync, ok := msg.(*protocol.ReplicationSync)
+		sync, ok := msg.(*clusterproto.ReplicationSync)
 		if !ok {
 			continue
 		}
 
 		applySync(db, sync)
 
-		_ = sendFrame(conn, &protocol.ReplicationAck{LastAppliedIndex: sync.LogIndex})
+		_ = protocol.WriteFrame(conn, &clusterproto.ReplicationAck{LastAppliedIndex: sync.LogIndex})
 	}
 }
 
-func applySync(db *store.KVStore, sync *protocol.ReplicationSync) {
+func applySync(db *store.KVStore, sync *clusterproto.ReplicationSync) {
 	key := string(sync.Key)
 	switch sync.Op {
 	case store.OpSet:
-		expiredAt := time.Unix(0, int64(sync.TTL))
+		expiredAt := time.Unix(0, int64(sync.ExpiresAt))
 		if err := db.SetWithExpiry(key, sync.Value, expiredAt); err != nil {
 			fmt.Printf("follower: apply SET %q error: %v\n", key, err)
 		}
