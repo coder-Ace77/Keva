@@ -1,0 +1,239 @@
+KEVA PROTOCOL — HOW IT WORKS
+============================
+
+Binary, big-endian, over plain TCP. One package for the machinery (protocol/),
+three sub-packages for the actual messages (kv/, cluster/, client/).
+
+1. LAYOUT
+---------
+
+protocol/
+  message.go        Message interface, registry, EncodeMessage / DecodeMessage
+  frame.go          ReadFrame / WriteFrame / EncodeFrame (TCP length prefix)
+  opcodes_table.go  every opcode byte, in one table
+  errors.go         decode errors, ErrCode* constants, ErrorMessage (0xFE)
+
+  kv/               client CRUD
+    get_protocol_request.go       GetRequest       0x01
+    get_protocol_response.go      GetResponse      0x04
+    set_protocol_request.go       SetRequest       0x02
+    set_protocol_response.go      SetResponse      0x05
+    delete_protocol_request.go    DeleteRequest    0x03
+    delete_protocol_response.go   DeleteResponse   0x06
+
+  cluster/          node <-> node (imported as `clusterproto`)
+    heartbeat_protocol_request.go           Heartbeat        0x30
+    heartbeat_protocol_response.go          HeartbeatAck     0x31
+    vote_protocol_request.go                VoteRequest      0x40
+    vote_protocol_response.go               VoteResponse     0x41
+    replication_join_protocol_request.go    ReplicationJoin  0x22
+    replication_sync_protocol_request.go    ReplicationSync  0x20
+    replication_sync_protocol_response.go   ReplicationAck   0x21
+
+  client/           client session (imported as `clientproto`)
+    topology_protocol_request.go   TopologyRequest   0x10
+    topology_protocol_response.go  TopologyResponse  0x11  (+ NodeInfo, role consts)
+
+Dependency direction: sub-packages import protocol/. protocol/ never imports
+them -> no import cycles.
+
+
+2. THREE LAYERS OF A MESSAGE ON THE WIRE
+----------------------------------------
+
+  +-------------------+-------------+----------------------+
+  | Length  (4B, u32) | OpCode (1B) | Payload (variable)   |
+  +-------------------+-------------+----------------------+
+  |<---- frame.go --->|<------- message.go -------------->|
+                                    |<-- msg.Encode() -->|
+
+  Length  = number of bytes AFTER the length field (opcode + payload).
+  OpCode  = which message type this is (opcodes_table.go).
+  Payload = the message's own fields, written by its Encode().
+
+  Each layer only knows its own job:
+    msg.Encode()/Decode()   -> payload bytes only, no opcode, no length
+    EncodeMessage()         -> prepends the opcode byte
+    EncodeFrame()/WriteFrame-> prepends the 4-byte length
+
+
+3. THE PATTERNS
+---------------
+
+(a) One interface for every message
+
+      type Message interface {
+          OpCode() byte
+          Encode() ([]byte, error)
+          Decode(data []byte) error
+      }
+
+    Code that sends/receives never needs to know the concrete type.
+
+(b) Registry instead of a big switch (message.go)
+
+      registry: map[opcode] -> func() Message   (factory for an empty struct)
+
+    Every message file registers itself:
+
+      func init() {
+          protocol.Register(protocol.OpGet, func() protocol.Message { return &GetRequest{} })
+      }
+
+    Register panics on a duplicate opcode, so collisions fail at startup.
+
+(c) Decoding = lookup + construct + decode
+
+      DecodeMessage(data):
+        opcode := data[0]
+        msg    := Lookup(opcode)        // fresh empty struct, or ErrUnknownOpCode
+        msg.Decode(data[1:])            // fills the fields
+        return msg
+
+    Caller then uses a type switch / assertion:
+        switch m := msg.(type) { case *kv.GetRequest: ... }
+
+(d) Same pattern again on the server side (engine/handler.go)
+
+      handlers: map[opcode] -> func(msg, store) (response, error)
+
+    engine.Dispatch(msg) looks up the handler by msg.OpCode().
+
+NOTE: a message type is only decodable if its sub-package is imported
+somewhere in the binary (that is what runs its init()). Every consumer
+already imports the packages whose types it handles.
+
+
+4. FRAMING (frame.go)
+---------------------
+
+  WriteFrame(w, msg)        encode + length prefix, ONE conn.Write
+  EncodeFrame(msg)          same bytes, returned; leader builds a frame once
+                            and writes it to every follower
+  ReadFrame(r, maxLen)      read length, read body, decode
+                            maxLen = 0 means no limit
+
+  ReadFrame error kinds — callers react differently:
+    ErrFrameTooLarge      length > maxLen, body NOT read  -> reply error, drop conn
+    ErrMalformedMessage   body read but undecodable; stream is still aligned
+                          -> may keep reading (follower does `continue`)
+    anything else         I/O error (EOF, reset, timeout) -> drop conn
+
+  errors.Is(err, ErrMalformedMessage) also matches the inner cause
+  (ErrUnknownOpCode / ErrPayloadTooShort), because both are wrapped.
+
+
+5. PAYLOAD ENCODING RULES
+-------------------------
+
+  - All integers big-endian.
+  - Variable fields are length-prefixed: strings/keys/addrs use 2B (u16),
+    values use 4B (u32).
+  - Booleans: 1 byte, 0x01 = true, anything else = false.
+  - Every Decode checks lengths before slicing; short input ->
+    protocol.ErrPayloadTooShort (never a panic). Tested for every
+    truncated prefix in *_protocol_test.go.
+  - Decode copies byte slices, so messages don't alias the read buffer.
+
+
+6. PAYLOAD LAYOUTS
+------------------
+
+kv
+  GetRequest      0x01  [KeyLen 2][Key]
+  SetRequest      0x02  [KeyLen 2][ValLen 4][TTL 8][Key][Value]
+                        TTL = duration in ns, 0 = server default
+  DeleteRequest   0x03  [KeyLen 2][Key]
+  GetResponse     0x04  [Found 1][ValLen 4][Value]
+  SetResponse     0x05  [Success 1][MsgLen 2][Message]
+  DeleteResponse  0x06  [Success 1][MsgLen 2][Message]
+
+client
+  TopologyRequest  0x10  (empty)
+  TopologyResponse 0x11  [LeaderLen 2][Leader][NodeCount 2]
+                         then per node: [AddrLen 2][Addr][Role 1][IDLen 2][ID]
+                         Role: 0x00 follower, 0x01 leader
+
+cluster
+  ReplicationSync  0x20  [LogIndex 8][Op 1][KeyLen 2][ValLen 4][ExpiresAt 8][Key][Value]
+                         Op = store.OpSet (1) / store.OpDelete (2)
+                         ExpiresAt = ABSOLUTE Unix ns (not a duration!), 0 for delete
+  ReplicationAck   0x21  [LastAppliedIndex 8]
+  ReplicationJoin  0x22  [AddrLen 2][Addr]
+  Heartbeat        0x30  [Term 8][LeaderIDLen 2][LeaderID]
+  HeartbeatAck     0x31  [Term 8][LastAppliedIndex 8]
+  VoteRequest      0x40  [Term 8][CandidateIDLen 2][CandidateID][LastLogIndex 8]
+  VoteResponse     0x41  [Term 8][Granted 1]
+
+core
+  ErrorMessage     0xFE  [Code 2][MsgLen 2][Message]
+                         Codes: 1 NotLeader, 2 KeyNotFound, 3 Internal,
+                                4 BadRequest, 5 Timeout
+
+
+7. CONVERSATIONS (who sends what)
+---------------------------------
+
+The server (server/tcp.go) decides what a connection is from its FIRST frame.
+
+Client session (long-lived, many commands per connection):
+  client --TopologyRequest-->    node      answered by the server directly
+  client <--TopologyResponse--   node
+  client --Get/Set/DeleteRequest--> node   -> engine.Dispatch -> store
+  client <--Get/Set/DeleteResponse or ErrorMessage--
+  ... repeat until client closes.
+  CLI routes SET/DEL to the leader, GET to a random follower.
+
+Heartbeat (one-shot connection, every 50 ms from leader to each peer):
+  leader --Heartbeat-->     peer
+  leader <--HeartbeatAck--  peer           conn closed
+
+Election (one-shot connection per peer):
+  candidate --VoteRequest-->   peer
+  candidate <--VoteResponse--  peer        conn closed
+
+Replication (long-lived, follower opens it):
+  follower --ReplicationJoin-->   leader   (leader rejects w/ ErrorMessage
+                                            NotLeader if it isn't leader)
+  leader   --ReplicationSync-->   follower  one per SET/DEL on the leader
+  follower --ReplicationAck-->    leader    one per applied sync
+  ... until either side drops; follower reconnects to the new leader.
+
+
+8. WHO USES WHAT
+----------------
+
+  server/tcp.go         ReadFrame/WriteFrame, first-frame type switch,
+                        clusterproto (heartbeat, vote, join)
+  engine/*.go           kv requests -> kv responses / ErrorMessage
+  cluster/raft.go       clusterproto Heartbeat, VoteRequest/Response
+  cluster/leader.go     EncodeFrame + ReplicationSync broadcast, reads acks
+  cluster/follower.go   ReplicationJoin, ReplicationSync, ReplicationAck
+  cluster/node.go       builds clientproto.TopologyResponse
+  cli/cli.go            kv + clientproto, WriteFrame/ReadFrame
+  bench/client          clientproto topology, WriteFrame/ReadFrame
+  bench/loadgen         kv Get/SetRequest
+
+
+9. ADDING A NEW MESSAGE
+-----------------------
+
+  1. Add the opcode to opcodes_table.go (pick the right 0xN_ group).
+  2. Create <name>_protocol_<request|response>.go in the right sub-package:
+       - wire-format comment block
+       - init() { protocol.Register(op, factory) }
+       - struct + OpCode / Encode / Decode (length-check before slicing)
+  3. Add it to that package's *_protocol_test.go round-trip list.
+  4. Handle it: engine.Register for client commands, or a case in
+     server/tcp.go handleConnection for cluster/session messages.
+  No change to the decode path is ever needed.
+
+
+10. KNOWN LIMITS
+----------------
+
+  - No versioning / magic byte: a changed layout breaks old peers silently.
+  - Lengths are u16/u32 casts with no overflow check on Encode: a key over
+    65535 bytes would be truncated on the wire.
+  - VoteRequest.LastLogIndex and HeartbeatAck.LastAppliedIndex are sent but
+    never filled or checked; ReplicationAck is read but ignored.

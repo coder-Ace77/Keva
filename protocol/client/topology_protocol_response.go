@@ -1,20 +1,9 @@
-package protocol
+package client
 
 import (
 	"encoding/binary"
+	"key_value_store/protocol"
 )
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TopologyRequest — Client asks any node for the cluster layout.
-//
-// Wire format: (empty — the opcode alone is sufficient)
-// ─────────────────────────────────────────────────────────────────────────────
-
-type TopologyRequest struct{}
-
-func (t *TopologyRequest) OpCode() byte         { return OpTopologyRequest }
-func (t *TopologyRequest) Encode() ([]byte, error) { return []byte{}, nil }
-func (t *TopologyRequest) Decode(data []byte) error { return nil }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TopologyResponse — Node replies with the full cluster map.
@@ -32,6 +21,10 @@ func (t *TopologyRequest) Decode(data []byte) error { return nil }
 //   2. Pick a random follower for reads
 // ─────────────────────────────────────────────────────────────────────────────
 
+func init() {
+	protocol.Register(protocol.OpTopologyResponse, func() protocol.Message { return &TopologyResponse{} })
+}
+
 const (
 	TopologyRoleFollower byte = 0x00
 	TopologyRoleLeader   byte = 0x01
@@ -39,7 +32,7 @@ const (
 
 type NodeInfo struct {
 	Address string
-	Role    byte   // TopologyRoleFollower or TopologyRoleLeader
+	Role    byte // TopologyRoleFollower or TopologyRoleLeader
 	NodeID  string
 }
 
@@ -48,7 +41,7 @@ type TopologyResponse struct {
 	Nodes      []NodeInfo
 }
 
-func (t *TopologyResponse) OpCode() byte { return OpTopologyResponse }
+func (t *TopologyResponse) OpCode() byte { return protocol.OpTopologyResponse }
 
 func (t *TopologyResponse) Encode() ([]byte, error) {
 	// Calculate total size
@@ -56,9 +49,7 @@ func (t *TopologyResponse) Encode() ([]byte, error) {
 	size := 2 + len(leaderBytes) + 2 // leaderAddrLen + leaderAddr + nodeCount
 
 	for _, n := range t.Nodes {
-		addrBytes := []byte(n.Address)
-		idBytes := []byte(n.NodeID)
-		size += 2 + len(addrBytes) + 1 + 2 + len(idBytes) // addrLen + addr + role + idLen + id
+		size += 2 + len(n.Address) + 1 + 2 + len(n.NodeID) // addrLen + addr + role + idLen + id
 	}
 
 	buf := make([]byte, size)
@@ -98,7 +89,7 @@ func (t *TopologyResponse) Encode() ([]byte, error) {
 
 func (t *TopologyResponse) Decode(data []byte) error {
 	if len(data) < 4 {
-		return ErrPayloadTooShort
+		return protocol.ErrPayloadTooShort
 	}
 
 	offset := 0
@@ -107,14 +98,14 @@ func (t *TopologyResponse) Decode(data []byte) error {
 	leaderLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 	offset += 2
 	if len(data) < offset+leaderLen {
-		return ErrPayloadTooShort
+		return protocol.ErrPayloadTooShort
 	}
 	t.LeaderAddr = string(data[offset : offset+leaderLen])
 	offset += leaderLen
 
 	// Node count
 	if len(data) < offset+2 {
-		return ErrPayloadTooShort
+		return protocol.ErrPayloadTooShort
 	}
 	nodeCount := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 	offset += 2
@@ -124,31 +115,31 @@ func (t *TopologyResponse) Decode(data []byte) error {
 	for i := 0; i < nodeCount; i++ {
 		// Address
 		if len(data) < offset+2 {
-			return ErrPayloadTooShort
+			return protocol.ErrPayloadTooShort
 		}
 		addrLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 		offset += 2
 		if len(data) < offset+addrLen {
-			return ErrPayloadTooShort
+			return protocol.ErrPayloadTooShort
 		}
 		addr := string(data[offset : offset+addrLen])
 		offset += addrLen
 
 		// Role
 		if len(data) < offset+1 {
-			return ErrPayloadTooShort
+			return protocol.ErrPayloadTooShort
 		}
 		role := data[offset]
 		offset++
 
 		// NodeID
 		if len(data) < offset+2 {
-			return ErrPayloadTooShort
+			return protocol.ErrPayloadTooShort
 		}
 		idLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 		offset += 2
 		if len(data) < offset+idLen {
-			return ErrPayloadTooShort
+			return protocol.ErrPayloadTooShort
 		}
 		nodeID := string(data[offset : offset+idLen])
 		offset += idLen

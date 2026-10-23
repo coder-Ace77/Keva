@@ -2,11 +2,11 @@ package main
 
 import (
 	"bufio"
-	"encoding/binary"
 	"flag"
 	"fmt"
-	"io"
 	"key_value_store/protocol"
+	clientproto "key_value_store/protocol/client"
+	"key_value_store/protocol/kv"
 	"math/rand"
 	"net"
 	"os"
@@ -30,11 +30,10 @@ type kvClient struct {
 	knownAddrs []string // seed + topology-discovered addresses
 	leaderAddr string
 	followers  []string
-	authToken  string
 }
 
-func newClient(seed string, token string) *kvClient {
-	return &kvClient{knownAddrs: []string{seed}, authToken: token}
+func newClient(seed string) *kvClient {
+	return &kvClient{knownAddrs: []string{seed}}
 }
 
 // connect fetches topology from any reachable known node and updates routing state.
@@ -117,7 +116,7 @@ func (c *kvClient) waitForLeader() error {
 	return fmt.Errorf("no leader elected after 4.5s — cluster may be down")
 }
 
-func (c *kvClient) fetchTopology(addr string) (*protocol.TopologyResponse, error) {
+func (c *kvClient) fetchTopology(addr string) (*clientproto.TopologyResponse, error) {
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return nil, err
@@ -125,18 +124,14 @@ func (c *kvClient) fetchTopology(addr string) (*protocol.TopologyResponse, error
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(2 * time.Second)) //nolint
 
-	if err := c.authConn(conn); err != nil {
-		return nil, err
-	}
-
-	if err := sendMessage(conn, &protocol.TopologyRequest{}); err != nil {
+	if err := sendMessage(conn, &clientproto.TopologyRequest{}); err != nil {
 		return nil, err
 	}
 	msg, err := receiveMessage(conn)
 	if err != nil {
 		return nil, err
 	}
-	topo, ok := msg.(*protocol.TopologyResponse)
+	topo, ok := msg.(*clientproto.TopologyResponse)
 	if !ok {
 		return nil, fmt.Errorf("unexpected response type 0x%02X", msg.OpCode())
 	}
@@ -151,75 +146,20 @@ func (c *kvClient) sendToNode(addr string, msg protocol.Message) (protocol.Messa
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint
 
-	if err := c.authConn(conn); err != nil {
-		return nil, err
-	}
-
 	if err := sendMessage(conn, msg); err != nil {
 		return nil, err
 	}
 	return receiveMessage(conn)
 }
 
-// authConn sends OpAuth and verifies the response when a token is configured.
-// It is a no-op when no token is set.
-func (c *kvClient) authConn(conn net.Conn) error {
-	if c.authToken == "" {
-		return nil
-	}
-
-	if err := sendMessage(conn, &protocol.AuthMessage{Token: []byte(c.authToken)}); err != nil {
-		return fmt.Errorf("auth send: %w", err)
-	}
-
-	resp, err := receiveMessage(conn)
-	if err != nil {
-		return fmt.Errorf("auth recv: %w", err)
-	}
-
-	authResp, ok := resp.(*protocol.AuthResponse)
-	if !ok {
-		// Server sent an error instead of AuthResponse
-		if errMsg, ok := resp.(*protocol.ErrorMessage); ok {
-			return fmt.Errorf("auth rejected: %s", errMsg.Message)
-		}
-		return fmt.Errorf("unexpected auth response opcode 0x%02X", resp.OpCode())
-	}
-
-	if !authResp.Success {
-		return fmt.Errorf("authentication failed: invalid token")
-	}
-
-	return nil
-}
-
 // ── Wire helpers ──────────────────────────────────────────────────────────────
 
 func sendMessage(conn net.Conn, msg protocol.Message) error {
-	wire, err := protocol.EncodeMessage(msg)
-	if err != nil {
-		return err
-	}
-	header := make([]byte, 4)
-	binary.BigEndian.PutUint32(header, uint32(len(wire)))
-	if _, err := conn.Write(header); err != nil {
-		return err
-	}
-	_, err = conn.Write(wire)
-	return err
+	return protocol.WriteFrame(conn, msg)
 }
 
 func receiveMessage(conn net.Conn) (protocol.Message, error) {
-	header := make([]byte, 4)
-	if _, err := io.ReadFull(conn, header); err != nil {
-		return nil, err
-	}
-	msgLen := binary.BigEndian.Uint32(header)
-	frame := make([]byte, msgLen)
-	if _, err := io.ReadFull(conn, frame); err != nil {
-		return nil, err
-	}
-	return protocol.DecodeMessage(frame)
+	return protocol.ReadFrame(conn, 0)
 }
 
 // ── Main REPL ─────────────────────────────────────────────────────────────────
@@ -227,8 +167,6 @@ func receiveMessage(conn net.Conn) (protocol.Message, error) {
 func main() {
 	url := flag.String("url", "", "any cluster node to connect to (e.g. localhost:7001)")
 	flag.StringVar(url, "u", "", "any cluster node to connect to (shorthand)")
-	token := flag.String("token", "", "auth token (or set KV_AUTH_TOKEN env var)")
-	flag.StringVar(token, "t", "", "auth token (shorthand)")
 	flag.Parse()
 
 	seed := defaultAddr
@@ -238,14 +176,9 @@ func main() {
 		seed = v
 	}
 
-	authToken := *token
-	if authToken == "" {
-		authToken = os.Getenv("KV_AUTH_TOKEN")
-	}
-
 	fmt.Printf("%s%sConnecting to cluster via %s...%s\n", ColorCyan, ColorBold, seed, ColorReset)
 
-	client := newClient(seed, authToken)
+	client := newClient(seed)
 	if err := client.waitForLeader(); err != nil {
 		fmt.Printf("%sFailed to discover cluster: %v%s\n", ColorRed, err, ColorReset)
 		os.Exit(1)
@@ -303,13 +236,13 @@ func parseCommand(input string) (protocol.Message, error) {
 		if len(parts) != 2 {
 			return nil, fmt.Errorf("usage: GET <key>")
 		}
-		return &protocol.GetPayload{Key: []byte(parts[1])}, nil
+		return &kv.GetRequest{Key: []byte(parts[1])}, nil
 
 	case "SET":
 		if len(parts) < 3 {
 			return nil, fmt.Errorf("usage: SET <key> <value>")
 		}
-		return &protocol.SetPayload{
+		return &kv.SetRequest{
 			Key:   []byte(parts[1]),
 			Value: []byte(strings.Join(parts[2:], " ")),
 		}, nil
@@ -318,7 +251,7 @@ func parseCommand(input string) (protocol.Message, error) {
 		if len(parts) != 2 {
 			return nil, fmt.Errorf("usage: DEL <key>")
 		}
-		return &protocol.DeletePayload{Key: []byte(parts[1])}, nil
+		return &kv.DeleteRequest{Key: []byte(parts[1])}, nil
 
 	default:
 		return nil, fmt.Errorf("unknown command %q — available: GET, SET, DEL, topology", parts[0])
@@ -334,21 +267,21 @@ func printTopology(c *kvClient) {
 
 func printResponse(msg protocol.Message) {
 	switch r := msg.(type) {
-	case *protocol.GetResponse:
+	case *kv.GetResponse:
 		if r.Found {
 			fmt.Printf("%s%s\"%s\"%s\n", ColorCyan, ColorBold, string(r.Value), ColorReset)
 		} else {
 			fmt.Printf("%s(nil)%s\n", ColorYellow, ColorReset)
 		}
 
-	case *protocol.SetResponse:
+	case *kv.SetResponse:
 		if r.Success {
 			fmt.Printf("%s%s%s\n", ColorGreen, r.Message, ColorReset)
 		} else {
 			fmt.Printf("%s%s%s%s\n", ColorRed, ColorBold, r.Message, ColorReset)
 		}
 
-	case *protocol.DeleteResponse:
+	case *kv.DeleteResponse:
 		if r.Success {
 			fmt.Printf("%s%s%s\n", ColorGreen, r.Message, ColorReset)
 		} else {

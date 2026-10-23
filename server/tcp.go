@@ -1,13 +1,12 @@
 package server
 
 import (
-	"crypto/subtle"
-	"encoding/binary"
+	"errors"
 	"fmt"
-	"io"
 	"key_value_store/cluster"
 	"key_value_store/engine"
 	"key_value_store/protocol"
+	clusterproto "key_value_store/protocol/cluster"
 	"net"
 )
 
@@ -15,11 +14,10 @@ type TCPServer struct {
 	node            *cluster.Node
 	listener        net.Listener
 	maxPayloadBytes uint32
-	authToken       string
 }
 
-func NewTCPServer(node *cluster.Node, maxPayloadBytes uint32, authToken string) *TCPServer {
-	return &TCPServer{node: node, maxPayloadBytes: maxPayloadBytes, authToken: authToken}
+func NewTCPServer(node *cluster.Node, maxPayloadBytes uint32) *TCPServer {
+	return &TCPServer{node: node, maxPayloadBytes: maxPayloadBytes}
 }
 
 func (s *TCPServer) Start(address string) error {
@@ -29,9 +27,6 @@ func (s *TCPServer) Start(address string) error {
 		return err
 	}
 	fmt.Printf("node listening on %s\n", address)
-	if s.authToken != "" {
-		fmt.Println("auth: token authentication enabled")
-	}
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -42,9 +37,9 @@ func (s *TCPServer) Start(address string) error {
 	}
 }
 
-// handleConnection reads the first frame and routes based on opcode.
-// Cluster-internal opcodes (heartbeat, vote, replication) bypass auth.
-// All client traffic must authenticate first when a token is configured.
+// handleConnection reads the first frame and routes based on opcode:
+// cluster-internal opcodes (heartbeat, vote, replication) get their own
+// handling; anything else starts a client command loop.
 func (s *TCPServer) handleConnection(conn net.Conn) {
 	firstMsg, err := s.readMessage(conn)
 	if err != nil {
@@ -54,32 +49,25 @@ func (s *TCPServer) handleConnection(conn net.Conn) {
 
 	switch firstMsg.OpCode() {
 
-	// ── Cluster internal messages — bypass auth ───────────────────────────
+	// ── Cluster internal messages ─────────────────────────────────────────
 	case protocol.OpReplicationJoin:
 		s.handleReplicationPeer(conn, firstMsg)
 
 	case protocol.OpHeartbeat:
 		defer conn.Close()
-		hb := firstMsg.(*protocol.Heartbeat)
+		hb := firstMsg.(*clusterproto.Heartbeat)
 		s.node.HandleHeartbeat(hb.Term, hb.LeaderID)
-		_ = s.writeMessage(conn, &protocol.HeartbeatAck{Term: s.node.GetTerm()})
+		_ = s.writeMessage(conn, &clusterproto.HeartbeatAck{Term: s.node.GetTerm()})
 
 	case protocol.OpVoteRequest:
 		defer conn.Close()
-		req := firstMsg.(*protocol.VoteRequest)
+		req := firstMsg.(*clusterproto.VoteRequest)
 		granted, term := s.node.HandleVoteRequest(req)
-		_ = s.writeMessage(conn, &protocol.VoteResponse{Term: term, Granted: granted})
+		_ = s.writeMessage(conn, &clusterproto.VoteResponse{Term: term, Granted: granted})
 
-	// ── All client traffic — auth gate applies ────────────────────────────
+	// ── Client traffic ────────────────────────────────────────────────────
 	default:
 		defer conn.Close()
-
-		if s.authToken != "" {
-			firstMsg, err = s.authenticate(conn, firstMsg)
-			if err != nil {
-				return
-			}
-		}
 
 		s.dispatchClient(conn, firstMsg)
 		for {
@@ -90,30 +78,6 @@ func (s *TCPServer) handleConnection(conn net.Conn) {
 			s.dispatchClient(conn, msg)
 		}
 	}
-}
-
-// authenticate validates the OpAuth handshake. Returns the first real command
-// message to process, or an error if auth fails.
-func (s *TCPServer) authenticate(conn net.Conn, firstMsg protocol.Message) (protocol.Message, error) {
-	if firstMsg.OpCode() != protocol.OpAuth {
-		s.writeError(conn, protocol.ErrCodeUnauthorized, "authentication required")
-		return nil, fmt.Errorf("auth required")
-	}
-
-	auth := firstMsg.(*protocol.AuthMessage)
-	tokenMatch := subtle.ConstantTimeCompare(auth.Token, []byte(s.authToken)) == 1
-	if !tokenMatch {
-		_ = s.writeMessage(conn, &protocol.AuthResponse{Success: false})
-		return nil, fmt.Errorf("invalid token")
-	}
-
-	_ = s.writeMessage(conn, &protocol.AuthResponse{Success: true})
-
-	msg, err := s.readMessage(conn)
-	if err != nil {
-		return nil, err
-	}
-	return msg, nil
 }
 
 // dispatchClient routes client messages: topology requests are handled directly,
@@ -132,7 +96,7 @@ func (s *TCPServer) handleReplicationPeer(conn net.Conn, firstMsg protocol.Messa
 		conn.Close()
 		return
 	}
-	join := firstMsg.(*protocol.ReplicationJoin)
+	join := firstMsg.(*clusterproto.ReplicationJoin)
 	s.node.Leader().AddFollower(join.NodeAddr, conn)
 }
 
@@ -148,39 +112,18 @@ func (s *TCPServer) dispatchToEngine(conn net.Conn, msg protocol.Message) {
 }
 
 func (s *TCPServer) readMessage(conn net.Conn) (protocol.Message, error) {
-	header := make([]byte, 4)
-	if _, err := io.ReadFull(conn, header); err != nil {
-		return nil, err
-	}
-	msgLen := binary.BigEndian.Uint32(header)
-	if msgLen > s.maxPayloadBytes {
+	msg, err := protocol.ReadFrame(conn, s.maxPayloadBytes)
+	switch {
+	case errors.Is(err, protocol.ErrFrameTooLarge):
 		s.writeError(conn, protocol.ErrCodeBadRequest, "payload too large")
-		return nil, fmt.Errorf("payload too large")
-	}
-	frame := make([]byte, msgLen)
-	if _, err := io.ReadFull(conn, frame); err != nil {
-		return nil, err
-	}
-	msg, err := protocol.DecodeMessage(frame)
-	if err != nil {
+	case errors.Is(err, protocol.ErrMalformedMessage):
 		s.writeError(conn, protocol.ErrCodeBadRequest, err.Error())
-		return nil, err
 	}
-	return msg, nil
+	return msg, err
 }
 
 func (s *TCPServer) writeMessage(conn net.Conn, msg protocol.Message) error {
-	wire, err := protocol.EncodeMessage(msg)
-	if err != nil {
-		return err
-	}
-	header := make([]byte, 4)
-	binary.BigEndian.PutUint32(header, uint32(len(wire)))
-	if _, err := conn.Write(header); err != nil {
-		return err
-	}
-	_, err = conn.Write(wire)
-	return err
+	return protocol.WriteFrame(conn, msg)
 }
 
 func (s *TCPServer) writeError(conn net.Conn, code uint16, message string) {

@@ -50,21 +50,28 @@ keyvaluestore/
 ├── config/
 │   └── config.go            Typed config struct + env-var loader
 ├── protocol/
-│   ├── payload.go           Message interface + registry
-│   ├── opcodes.go           All wire opcodes and error codes
-│   ├── registry_init.go     init() registers all message types
-│   ├── get_payload.go       OpGet (0x01)
-│   ├── set_payload.go       OpSet (0x02)
-│   ├── delete_payload.go    OpDelete (0x03)
-│   ├── get_response.go      OpGetResponse (0x04)
-│   ├── response_payload.go  OpSetResponse (0x05), OpDeleteResponse (0x06)
-│   ├── topology.go          OpTopologyRequest (0x10), OpTopologyResponse (0x11)
-│   ├── replication.go       OpReplicationSync (0x20), OpReplicationAck (0x21)
-│   ├── replication_join.go  OpReplicationJoin (0x22)
-│   ├── heartbeat.go         OpHeartbeat (0x30), OpHeartbeatAck (0x31)
-│   ├── election.go          OpVoteRequest (0x40), OpVoteResponse (0x41)
-│   ├── forward.go           OpForwardWrite (0x50), OpForwardWriteResponse (0x51)
-│   └── error.go             OpError (0xFE)
+│   ├── message.go           Message interface, registry, EncodeMessage/DecodeMessage
+│   ├── frame.go             Length-prefixed TCP framing: ReadFrame / WriteFrame / EncodeFrame
+│   ├── opcodes_table.go     Every wire opcode, in one table
+│   ├── errors.go            Decode errors, ErrCode* constants, ErrorMessage (0xFE)
+│   ├── kv/                  Client CRUD messages
+│   │   ├── get_protocol_request.go       GetRequest (0x01)
+│   │   ├── get_protocol_response.go      GetResponse (0x04)
+│   │   ├── set_protocol_request.go       SetRequest (0x02)
+│   │   ├── set_protocol_response.go      SetResponse (0x05)
+│   │   ├── delete_protocol_request.go    DeleteRequest (0x03)
+│   │   └── delete_protocol_response.go   DeleteResponse (0x06)
+│   ├── cluster/             Node ↔ node messages (election + replication)
+│   │   ├── heartbeat_protocol_request.go          Heartbeat (0x30)
+│   │   ├── heartbeat_protocol_response.go         HeartbeatAck (0x31)
+│   │   ├── vote_protocol_request.go               VoteRequest (0x40)
+│   │   ├── vote_protocol_response.go              VoteResponse (0x41)
+│   │   ├── replication_join_protocol_request.go   ReplicationJoin (0x22)
+│   │   ├── replication_sync_protocol_request.go   ReplicationSync (0x20)
+│   │   └── replication_sync_protocol_response.go  ReplicationAck (0x21)
+│   └── client/              Client session messages (cluster discovery)
+│       ├── topology_protocol_request.go   TopologyRequest (0x10)
+│       └── topology_protocol_response.go  TopologyResponse (0x11), NodeInfo
 ├── store/
 │   ├── store.go             Sharded hash map + TTL + WAL replay + compaction
 │   └── wal.go               Write-ahead log with three sync modes
@@ -78,8 +85,7 @@ keyvaluestore/
 │   ├── raft.go              Raft state machine (election, heartbeat, vote RPC)
 │   ├── node.go              Node struct — wraps store, implements engine.Store
 │   ├── leader.go            Leader struct — manages follower conns, broadcasts
-│   ├── follower.go          Follower goroutine — syncs with current leader
-│   └── wire.go              sendFrame / readFrame TCP helpers
+│   └── follower.go          Follower goroutine — syncs with current leader
 ├── server/
 │   └── tcp.go               TCP server — first-message routing, client loop
 ├── cli/
@@ -104,7 +110,11 @@ DecodeMessage([]byte)     → reads opcode, looks up factory, calls msg.Decode()
 EncodeMessage(Message)    → calls msg.Encode(), prepends opcode byte
 ```
 
-Adding a new message type requires: one struct implementing `Message`, one `Register` call in `registry_init.go`. No changes to any dispatch path.
+Message types live in the domain sub-packages (`kv`, `cluster`, `client`), one file per message. Each file registers its own type in an `init()`; the core `protocol` package never imports the sub-packages, so there are no import cycles.
+
+Adding a new message type requires: an opcode in `opcodes_table.go`, and one `<name>_protocol_<request|response>.go` file with the struct and its `init()` → `Register` call. No changes to any dispatch path.
+
+All TCP framing goes through `protocol.ReadFrame` / `protocol.WriteFrame`. `ReadFrame` returns `ErrFrameTooLarge` for oversized frames and wraps decode failures in `ErrMalformedMessage` (stream still aligned), so callers can tell those apart from I/O errors.
 
 ### Message Interface
 
@@ -135,8 +145,6 @@ type Message interface {
 | 0x31 | `OpHeartbeatAck` | Peer → Leader | Liveness ack |
 | 0x40 | `OpVoteRequest` | Candidate → Peer | Request vote |
 | 0x41 | `OpVoteResponse` | Peer → Candidate | Grant/deny vote |
-| 0x50 | `OpForwardWrite` | Follower → Leader | Wrap a client write |
-| 0x51 | `OpForwardWriteResponse` | Leader → Follower | Forwarded result |
 | 0xFE | `OpError` | Any → Any | Structured error |
 
 ### Error Codes
@@ -471,18 +479,18 @@ Every message on the wire is preceded by a 4-byte big-endian length prefix:
 
 ### Per-Message Payload Layouts
 
-**GetPayload (0x01)**
+**GetRequest (0x01)**
 ```
 [KeyLen 2B][Key ...]
 ```
 
-**SetPayload (0x02)**
+**SetRequest (0x02)**
 ```
 [KeyLen 2B][ValLen 4B][TTL 8B][Key ...][Value ...]
 TTL: nanoseconds, 0 = use server default
 ```
 
-**DeletePayload (0x03)**
+**DeleteRequest (0x03)**
 ```
 [KeyLen 2B][Key ...]
 ```
@@ -509,9 +517,9 @@ Role: 0x00 = Follower, 0x01 = Leader
 
 **ReplicationSync (0x20)**
 ```
-[LogIndex 8B][Op 1B][KeyLen 2B][ValLen 4B][TTL 8B][Key ...][Value ...]
+[LogIndex 8B][Op 1B][KeyLen 2B][ValLen 4B][ExpiresAt 8B][Key ...][Value ...]
 Op: 1 = SET, 2 = DELETE
-TTL: absolute Unix nanoseconds for SET; 0 for DELETE
+ExpiresAt: absolute Unix nanoseconds for SET; 0 for DELETE
 ```
 
 **ReplicationJoin (0x22)**

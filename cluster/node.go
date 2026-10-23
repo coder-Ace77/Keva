@@ -1,7 +1,8 @@
 package cluster
 
 import (
-	"key_value_store/protocol"
+	clientproto "key_value_store/protocol/client"
+	clusterproto "key_value_store/protocol/cluster"
 	"key_value_store/store"
 	"sync"
 	"time"
@@ -91,30 +92,30 @@ func (n *Node) HandleHeartbeat(term uint64, leaderID string) {
 	n.raft.HandleHeartbeat(term, leaderID)
 }
 
-func (n *Node) HandleVoteRequest(req *protocol.VoteRequest) (granted bool, term uint64) {
+func (n *Node) HandleVoteRequest(req *clusterproto.VoteRequest) (granted bool, term uint64) {
 	return n.raft.HandleVoteRequest(req)
 }
 
 func (n *Node) GetTerm() uint64 { return n.raft.GetTerm() }
 
 // GetTopology returns the current cluster view for topology requests.
-func (n *Node) GetTopology() *protocol.TopologyResponse {
+func (n *Node) GetTopology() *clientproto.TopologyResponse {
 	leaderAddr := n.raft.GetLeaderAddr()
 	peers := n.raft.GetPeers()
 
-	nodes := make([]protocol.NodeInfo, 0, len(peers))
+	nodes := make([]clientproto.NodeInfo, 0, len(peers))
 	for _, addr := range peers {
-		role := protocol.TopologyRoleFollower
+		role := clientproto.TopologyRoleFollower
 		if addr == leaderAddr {
-			role = protocol.TopologyRoleLeader
+			role = clientproto.TopologyRoleLeader
 		}
-		nodes = append(nodes, protocol.NodeInfo{
+		nodes = append(nodes, clientproto.NodeInfo{
 			Address: addr,
 			Role:    role,
 			NodeID:  addr,
 		})
 	}
-	return &protocol.TopologyResponse{LeaderAddr: leaderAddr, Nodes: nodes}
+	return &clientproto.TopologyResponse{LeaderAddr: leaderAddr, Nodes: nodes}
 }
 
 // ── Role-change callbacks (called by RaftState, must not hold n.mu) ──────────

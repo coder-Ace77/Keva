@@ -34,6 +34,7 @@ import (
 
 	"key_value_store/bench/client"
 	"key_value_store/protocol"
+	"key_value_store/protocol/kv"
 )
 
 const (
@@ -61,13 +62,12 @@ func main() {
 	valSize   := flag.Int("value-size",    64,               "value payload size in bytes")
 	hotKeys   := flag.Int("hot-keys",      0,                "first N keys form the hot pool (0 = uniform)")
 	hotRatio  := flag.Float64("hot-ratio", 0.8,              "fraction of ops hitting the hot pool")
-	token     := flag.String("token",      os.Getenv("KV_AUTH_TOKEN"), "auth token")
 	flag.Parse()
 
 	seeds := strings.Split(*addr, ",")
 
 	fmt.Printf("discovering cluster via %v ...\n", seeds)
-	leaderAddr, peers, err := client.WaitForLeader(seeds, *token, 10*time.Second)
+	leaderAddr, peers, err := client.WaitForLeader(seeds, 10*time.Second)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -103,7 +103,7 @@ func main() {
 	var wg sync.WaitGroup
 	for i := 0; i < *workers; i++ {
 		wg.Add(1)
-		go runWorker(i, allSeeds, *token, keys, hk, *hotRatio, value, workCh, wResults[i], &wg)
+		go runWorker(i, allSeeds, keys, hk, *hotRatio, value, workCh, wResults[i], &wg)
 	}
 
 	// Open-loop coordinator: batch tokens so we tick at most 1000 Hz
@@ -227,7 +227,6 @@ loop:
 func runWorker(
 	id int,
 	seeds []string,
-	token string,
 	keys [][]byte,
 	hotKeys int,
 	hotRatio float64,
@@ -244,12 +243,12 @@ func runWorker(
 			conn.Close()
 		}
 		for {
-			la, _, err := client.DiscoverLeader(seeds, token)
+			la, _, err := client.DiscoverLeader(seeds)
 			if err != nil {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-			c, err := client.Dial(la, token, 3*time.Second)
+			c, err := client.Dial(la, 3*time.Second)
 			if err != nil {
 				time.Sleep(100 * time.Millisecond)
 				continue
@@ -280,9 +279,9 @@ func runWorker(
 		var resp protocol.Message
 		var opErr error
 		if isWrite {
-			resp, opErr = conn.Do(&protocol.SetPayload{Key: key, Value: value}, 5*time.Second)
+			resp, opErr = conn.Do(&kv.SetRequest{Key: key, Value: value}, 5*time.Second)
 		} else {
-			resp, opErr = conn.Do(&protocol.GetPayload{Key: key}, 5*time.Second)
+			resp, opErr = conn.Do(&kv.GetRequest{Key: key}, 5*time.Second)
 		}
 		latUs := time.Since(start).Microseconds()
 

@@ -1,39 +1,44 @@
-package protocol
+package kv
 
 import (
 	"encoding/binary"
+	"key_value_store/protocol"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DeletePayload — Client sends this to the leader to delete a key.
+// GetRequest — Client sends this to any node to read a key.
 //
 // Wire format:
 //   [KeyLen 2B] [Key ...]
 // ─────────────────────────────────────────────────────────────────────────────
 
-type DeletePayload struct {
+func init() {
+	protocol.Register(protocol.OpGet, func() protocol.Message { return &GetRequest{} })
+}
+
+type GetRequest struct {
 	Key []byte
 }
 
-func (d *DeletePayload) OpCode() byte { return OpDelete }
+func (g *GetRequest) OpCode() byte { return protocol.OpGet }
 
-func (d *DeletePayload) Encode() ([]byte, error) {
-	keyLen := len(d.Key)
+func (g *GetRequest) Encode() ([]byte, error) {
+	keyLen := len(g.Key)
 	buf := make([]byte, 2+keyLen)
 	binary.BigEndian.PutUint16(buf[0:2], uint16(keyLen))
-	copy(buf[2:], d.Key)
+	copy(buf[2:], g.Key)
 	return buf, nil
 }
 
-func (d *DeletePayload) Decode(data []byte) error {
+func (g *GetRequest) Decode(data []byte) error {
 	if len(data) < 2 {
-		return ErrPayloadTooShort
+		return protocol.ErrPayloadTooShort
 	}
 	keyLen := binary.BigEndian.Uint16(data[0:2])
 	if len(data) < 2+int(keyLen) {
-		return ErrPayloadTooShort
+		return protocol.ErrPayloadTooShort
 	}
-	d.Key = make([]byte, keyLen)
-	copy(d.Key, data[2:2+keyLen])
+	g.Key = make([]byte, keyLen)
+	copy(g.Key, data[2:2+keyLen])
 	return nil
 }
