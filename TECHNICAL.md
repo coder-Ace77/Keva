@@ -32,13 +32,15 @@ cli  ──►  TCP  ──►  server  ──►  engine  ──►  store
 | Package | Imports |
 |---------|---------|
 | `protocol` | stdlib only |
-| `store` | stdlib only |
-| `config` | stdlib only |
-| `engine` | `protocol`, `store` |
-| `cluster` | `protocol`, `store` |
+| `storage/wal` | stdlib only |
+| `storage/eviction` | stdlib only |
+| `storage/store` | `storage/wal`, `storage/eviction` |
+| `config` | `utils` |
+| `engine` | `protocol`, `storage/store` |
+| `cluster` | `protocol`, `storage/store`, `storage/wal` |
 | `server` | `engine`, `cluster`, `protocol` |
 | `cli` | `protocol` |
-| `main` | `server`, `cluster`, `store`, `config` |
+| `main` | `server`, `cluster`, `storage/*`, `config`, `utils` |
 
 ---
 
@@ -48,7 +50,10 @@ cli  ──►  TCP  ──►  server  ──►  engine  ──►  store
 keyvaluestore/
 ├── main.go                  Entry point; wires all packages together
 ├── config/
-│   └── config.go            Typed config struct + env-var loader
+│   ├── config_types.go      Config / ServerConfig / StoreConfig / WALConfig / ClusterConfig
+│   └── load_config.go       Default() values + Load() from KV_* env vars
+├── utils/
+│   └── memory_bytes.go      ParseMemoryBytes ("512MB" → bytes), FormatMemoryBytes
 ├── protocol/
 │   ├── message.go           Message interface, registry, EncodeMessage/DecodeMessage
 │   ├── frame.go             Length-prefixed TCP framing: ReadFrame / WriteFrame / EncodeFrame
@@ -72,9 +77,25 @@ keyvaluestore/
 │   └── client/              Client session messages (cluster discovery)
 │       ├── topology_protocol_request.go   TopologyRequest (0x10)
 │       └── topology_protocol_response.go  TopologyResponse (0x11), NodeInfo
-├── store/
-│   ├── store.go             Sharded hash map + TTL + WAL replay + compaction
-│   └── wal.go               Write-ahead log with three sync modes
+├── storage/
+│   ├── store/               In-memory sharded map; uses wal + eviction
+│   │   ├── kv_store.go      Options, KVStore, NewKVStore, Set / SetWithExpiry, Get, Delete, Close
+│   │   ├── kv_store_util.go recovery (wal.Replay → shards), TTL expiry sweep, Compact → wal.Compact
+│   │   ├── shard.go         Shard + Record; implements eviction.Shard
+│   │   └── errors.go        ErrKeyNotFound, ErrMemoryFull
+│   ├── wal/                 Write-ahead log; owns the on-disk format
+│   │   ├── wal_record.go    Record, OpSet/OpDelete, encode / readRecord
+│   │   ├── wal_options.go   SyncMode (always | interval | none), Options
+│   │   ├── wal_writer.go    WAL: Open, AppendSet/AppendDelete, interval flusher, Close
+│   │   ├── wal_replay.go    Replay(path, apply)
+│   │   └── wal_compaction.go  WAL.Compact(snapshot): .tmp + atomic rename
+│   └── eviction/            Memory-cap eviction, one policy instance per shard
+│       ├── eviction_policy.go         Policy interface, Factory, call contract
+│       ├── shard_view.go              Shard interface (what a policy may see/evict)
+│       ├── policy_names.go            "noevict" | "relaxed" | "strict" → ByName(name)
+│       ├── no_evict_policy.go         NoEvict — reject writes when full
+│       ├── sampling_evict_policy.go   SamplingEvict — evict soonest-expiring of 5 sampled
+│       └── lru_evict_policy.go        LRUEvict — exact LRU (list + map, own mutex)
 ├── engine/
 │   ├── handler.go           Store interface + handler registry + Dispatch
 │   ├── get.go               GET handler
@@ -188,7 +209,9 @@ type Record struct {
 
 ### Write-Ahead Log (WAL)
 
-The WAL provides crash recovery. All writes are appended to a binary log **before** the in-memory map is updated. On startup, `Replay()` re-executes every WAL entry to rebuild state.
+The WAL (`storage/wal`) provides crash recovery. All writes are appended to a binary log **before** the in-memory map is updated. On startup `NewKVStore` first calls `wal.Replay()` to rebuild state (skipping values that expired while the server was down), then opens the log once with `wal.Open()` for appending.
+
+`storage/wal` is the only package that knows the on-disk format (`wal_record.go`); the store only deals in `wal.Record` values.
 
 **WAL record format (binary, big-endian):**
 
@@ -212,11 +235,11 @@ Default: `interval` with 500 ms flush and 1000 entry batch.
 
 **WAL compaction:**
 
-`KVStore.Compact(filePath)` rewrites the WAL from current memory state, discarding all superseded operations. Steps:
-1. Write all live (non-expired) records to a `.tmp` file.
-2. Acquire the WAL mutex.
-3. Atomic `os.Rename(.tmp → filePath)`.
-4. Reopen the file for subsequent appends.
+`KVStore.Compact()` rewrites the WAL from current memory state, discarding all superseded operations. It hands `wal.WAL.Compact` a snapshot function that emits one `OpSet` record per live key. Steps:
+1. Write the snapshot records to `<path>.tmp` and fsync it.
+2. Acquire the WAL mutex (appends block).
+3. Atomic `os.Rename(.tmp → path)`.
+4. Reopen the file for subsequent appends, then close the old handle.
 
 ### SetWithExpiry
 

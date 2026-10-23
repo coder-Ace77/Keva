@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"key_value_store/protocol"
 	clusterproto "key_value_store/protocol/cluster"
-	"key_value_store/store"
+	"key_value_store/storage/wal"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -36,7 +36,7 @@ func (l *Leader) AddFollower(nodeAddr string, conn net.Conn) {
 func (l *Leader) BroadcastSet(key string, value []byte, expiredAt int64) {
 	l.broadcast(&clusterproto.ReplicationSync{
 		LogIndex:  l.logIndex.Add(1),
-		Op:        store.OpSet,
+		Op:        wal.OpSet,
 		Key:       []byte(key),
 		Value:     value,
 		ExpiresAt: uint64(expiredAt),
@@ -47,7 +47,7 @@ func (l *Leader) BroadcastSet(key string, value []byte, expiredAt int64) {
 func (l *Leader) BroadcastDelete(key string) {
 	l.broadcast(&clusterproto.ReplicationSync{
 		LogIndex: l.logIndex.Add(1),
-		Op:       store.OpDelete,
+		Op:       wal.OpDelete,
 		Key:      []byte(key),
 	})
 }

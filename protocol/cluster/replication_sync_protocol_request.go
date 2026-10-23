@@ -23,7 +23,7 @@ const replicationSyncHeaderSize = 8 + 1 + 2 + 4 + 8 // logIndex + op + keyLen + 
 
 type ReplicationSync struct {
 	LogIndex  uint64
-	Op        byte // store.OpSet or store.OpDelete — re-uses WAL-level ops
+	Op        byte // wal.OpSet or wal.OpDelete — re-uses WAL-level ops
 	Key       []byte
 	Value     []byte // Empty for deletes
 	ExpiresAt uint64 // Absolute expiry, Unix nanoseconds. 0 for deletes.

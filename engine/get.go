@@ -3,7 +3,7 @@ package engine
 import (
 	"key_value_store/protocol"
 	"key_value_store/protocol/kv"
-	"key_value_store/store"
+	"key_value_store/storage/store"
 )
 
 func handleGet(msg protocol.Message, db Store) (protocol.Message, error) {

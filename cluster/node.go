@@ -3,7 +3,7 @@ package cluster
 import (
 	clientproto "key_value_store/protocol/client"
 	clusterproto "key_value_store/protocol/cluster"
-	"key_value_store/store"
+	"key_value_store/storage/store"
 	"sync"
 	"time"
 )

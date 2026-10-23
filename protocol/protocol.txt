@@ -156,7 +156,7 @@ client
 
 cluster
   ReplicationSync  0x20  [LogIndex 8][Op 1][KeyLen 2][ValLen 4][ExpiresAt 8][Key][Value]
-                         Op = store.OpSet (1) / store.OpDelete (2)
+                         Op = wal.OpSet (1) / wal.OpDelete (2)
                          ExpiresAt = ABSOLUTE Unix ns (not a duration!), 0 for delete
   ReplicationAck   0x21  [LastAppliedIndex 8]
   ReplicationJoin  0x22  [AddrLen 2][Addr]
