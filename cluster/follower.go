@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"key_value_store/protocol"
 	clusterproto "key_value_store/protocol/cluster"
-	"key_value_store/store"
+	"key_value_store/storage/store"
+	"key_value_store/storage/wal"
 	"net"
 	"time"
 )
@@ -73,12 +74,12 @@ func syncWithLeader(leaderAddr string, db *store.KVStore, nodeAddr string) error
 func applySync(db *store.KVStore, sync *clusterproto.ReplicationSync) {
 	key := string(sync.Key)
 	switch sync.Op {
-	case store.OpSet:
+	case wal.OpSet:
 		expiredAt := time.Unix(0, int64(sync.ExpiresAt))
 		if err := db.SetWithExpiry(key, sync.Value, expiredAt); err != nil {
 			fmt.Printf("follower: apply SET %q error: %v\n", key, err)
 		}
-	case store.OpDelete:
+	case wal.OpDelete:
 		err := db.Delete(key)
 		if err != nil && err != store.ErrKeyNotFound {
 			fmt.Printf("follower: apply DELETE %q error: %v\n", key, err)
