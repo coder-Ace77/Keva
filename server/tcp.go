@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"key_value_store/cluster"
-	"key_value_store/engine"
+	"key_value_store/handlers"
 	"key_value_store/protocol"
 	clusterproto "key_value_store/protocol/cluster"
 	"net"
@@ -81,13 +81,13 @@ func (s *TCPServer) handleConnection(conn net.Conn) {
 }
 
 // dispatchClient routes client messages: topology requests are handled directly,
-// everything else goes through the engine.
+// everything else goes through the handlers.
 func (s *TCPServer) dispatchClient(conn net.Conn, msg protocol.Message) {
 	if msg.OpCode() == protocol.OpTopologyRequest {
-		_ = s.writeMessage(conn, s.node.GetTopology())
+		_ = s.writeMessage(conn, s.node.GetTopology(conn.LocalAddr().String()))
 		return
 	}
-	s.dispatchToEngine(conn, msg)
+	s.dispatchToHandlers(conn, msg)
 }
 
 func (s *TCPServer) handleReplicationPeer(conn net.Conn, firstMsg protocol.Message) {
@@ -100,8 +100,8 @@ func (s *TCPServer) handleReplicationPeer(conn net.Conn, firstMsg protocol.Messa
 	s.node.Leader().AddFollower(join.NodeAddr, conn)
 }
 
-func (s *TCPServer) dispatchToEngine(conn net.Conn, msg protocol.Message) {
-	resp, err := engine.Dispatch(msg, s.node)
+func (s *TCPServer) dispatchToHandlers(conn net.Conn, msg protocol.Message) {
+	resp, err := handlers.Dispatch(msg, s.node)
 	if err != nil {
 		s.writeError(conn, protocol.ErrCodeInternal, err.Error())
 		return
