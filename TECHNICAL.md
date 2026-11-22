@@ -5,7 +5,7 @@
 2. [Package Layout](#package-layout)
 3. [Protocol Layer](#protocol-layer)
 4. [Storage Engine](#storage-engine)
-5. [Engine Layer](#engine-layer)
+5. [Handlers Layer](#handlers-layer)
 6. [Cluster & Consensus](#cluster--consensus)
 7. [Server Layer](#server-layer)
 8. [CLI Client](#cli-client)
@@ -20,7 +20,7 @@
 The system is a distributed key-value store built in Go. It is structured as five independent layers with clean dependency boundaries:
 
 ```
-cli  ──►  TCP  ──►  server  ──►  engine  ──►  store
+cli  ──►  TCP  ──►  server  ──►  handlers  ──►  store
                        │
                     cluster  ──►  protocol
                        │
@@ -36,9 +36,9 @@ cli  ──►  TCP  ──►  server  ──►  engine  ──►  store
 | `storage/eviction` | stdlib only |
 | `storage/store` | `storage/wal`, `storage/eviction` |
 | `config` | `utils` |
-| `engine` | `protocol`, `storage/store` |
+| `handlers` | `protocol`, `storage/store` |
 | `cluster` | `protocol`, `storage/store`, `storage/wal` |
-| `server` | `engine`, `cluster`, `protocol` |
+| `server` | `handlers`, `cluster`, `protocol` |
 | `cli` | `protocol` |
 | `main` | `server`, `cluster`, `storage/*`, `config`, `utils` |
 
@@ -96,15 +96,15 @@ keyvaluestore/
 │       ├── no_evict_policy.go         NoEvict — reject writes when full
 │       ├── sampling_evict_policy.go   SamplingEvict — evict soonest-expiring of 5 sampled
 │       └── lru_evict_policy.go        LRUEvict — exact LRU (list + map, own mutex)
-├── engine/
-│   ├── handler.go           Store interface + handler registry + Dispatch
-│   ├── get.go               GET handler
-│   ├── set.go               SET handler
-│   ├── delete.go            DELETE handler
-│   └── registry_init.go     Registers all three CRUD handlers
+├── handlers/
+│   ├── handler_registry.go       Store interface + handler registry + Dispatch
+│   ├── handler_registry_init.go  Registers all three CRUD handlers
+│   ├── get_handler.go            GET handler
+│   ├── set_handler.go            SET handler
+│   └── delete_handler.go         DELETE handler
 ├── cluster/
 │   ├── raft.go              Raft state machine (election, heartbeat, vote RPC)
-│   ├── node.go              Node struct — wraps store, implements engine.Store
+│   ├── node.go              Node struct — wraps store, implements handlers.Store
 │   ├── leader.go            Leader struct — manages follower conns, broadcasts
 │   └── follower.go          Follower goroutine — syncs with current leader
 ├── server/
@@ -251,9 +251,9 @@ Used exclusively by replication followers. Accepts a caller-supplied absolute ex
 
 ---
 
-## Engine Layer
+## Handlers Layer
 
-The engine decouples command dispatch from both the protocol and the storage layers.
+The `handlers` package decouples command dispatch from both the protocol and the storage layers.
 
 ### Store Interface
 
@@ -265,7 +265,7 @@ type Store interface {
 }
 ```
 
-Both `*store.KVStore` (standalone) and `*cluster.Node` (cluster mode) satisfy this interface via Go structural typing — neither imports the `engine` package.
+Both `*store.KVStore` (standalone) and `*cluster.Node` (cluster mode) satisfy this interface via Go structural typing — neither imports the `handlers` package.
 
 ### Handler Registry
 
@@ -401,7 +401,7 @@ accept conn
 
 **Client loop:**
 1. `readMessage`: read 4-byte length, check against `maxPayloadBytes`, read frame, `DecodeMessage`.
-2. `engine.Dispatch(msg, node)` → response.
+2. `handlers.Dispatch(msg, node)` → response.
 3. `writeMessage`: encode response, write 4-byte length + wire bytes.
 4. Repeat until EOF or error.
 

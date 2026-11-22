@@ -9,13 +9,14 @@ import (
 )
 
 // Node wraps a KVStore and participates in Raft consensus.
-// It satisfies engine.Store structurally.
+// It satisfies handlers.Store structurally.
 type Node struct {
 	mu         sync.Mutex
 	db         *store.KVStore
 	defaultTTL time.Duration
 	raft       *RaftState
 	leader     *Leader // non-nil only while this node is the leader
+	standalone bool    // set by ForceLeader: single node, no Raft, no own address
 }
 
 // NewNode creates a node that will self-elect via Raft.
@@ -37,10 +38,11 @@ func (n *Node) Start() {
 func (n *Node) ForceLeader() {
 	n.mu.Lock()
 	n.leader = newLeader()
+	n.standalone = true
 	n.mu.Unlock()
 }
 
-// ── engine.Store interface ────────────────────────────────────────────────────
+// ── handlers.Store interface ──────────────────────────────────────────────────
 
 func (n *Node) Set(key string, value []byte, ttl time.Duration) error {
 	if ttl <= 0 {
@@ -99,7 +101,23 @@ func (n *Node) HandleVoteRequest(req *clusterproto.VoteRequest) (granted bool, t
 func (n *Node) GetTerm() uint64 { return n.raft.GetTerm() }
 
 // GetTopology returns the current cluster view for topology requests.
-func (n *Node) GetTopology() *clientproto.TopologyResponse {
+//
+// localAddr is the address the request arrived on. A standalone node has no
+// configured address and no Raft state, so it reports itself as the leader at
+// localAddr — the address the client already reached it on.
+func (n *Node) GetTopology(localAddr string) *clientproto.TopologyResponse {
+	n.mu.Lock()
+	standalone := n.standalone
+	n.mu.Unlock()
+	if standalone {
+		return &clientproto.TopologyResponse{
+			LeaderAddr: localAddr,
+			Nodes: []clientproto.NodeInfo{
+				{Address: localAddr, Role: clientproto.TopologyRoleLeader, NodeID: localAddr},
+			},
+		}
+	}
+
 	leaderAddr := n.raft.GetLeaderAddr()
 	peers := n.raft.GetPeers()
 

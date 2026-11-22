@@ -1,4 +1,4 @@
-package engine
+package handlers
 
 import (
 	"fmt"
@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// Store is the interface the engine dispatches against.
+// Store is the interface the handlers run against.
 // ttl == 0 in Set means "use the server default".
 type Store interface {
 	Set(key string, value []byte, ttl time.Duration) error
@@ -20,26 +20,26 @@ type Handler func(msg protocol.Message, db Store) (protocol.Message, error)
 
 var (
 	mu       sync.RWMutex
-	handlers = make(map[byte]Handler)
+	registry = make(map[byte]Handler)
 )
 
 // Register maps an opcode to a handler. Panics on duplicate registration.
 func Register(opcode byte, h Handler) {
 	mu.Lock()
 	defer mu.Unlock()
-	if _, exists := handlers[opcode]; exists {
-		panic(fmt.Sprintf("engine: duplicate handler for opcode 0x%02X", opcode))
+	if _, exists := registry[opcode]; exists {
+		panic(fmt.Sprintf("handlers: duplicate handler for opcode 0x%02X", opcode))
 	}
-	handlers[opcode] = h
+	registry[opcode] = h
 }
 
 // Dispatch routes a decoded message to its registered handler.
 func Dispatch(msg protocol.Message, db Store) (protocol.Message, error) {
 	mu.RLock()
-	h, ok := handlers[msg.OpCode()]
+	h, ok := registry[msg.OpCode()]
 	mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("engine: no handler for opcode 0x%02X", msg.OpCode())
+		return nil, fmt.Errorf("handlers: no handler for opcode 0x%02X", msg.OpCode())
 	}
 	return h(msg, db)
 }
